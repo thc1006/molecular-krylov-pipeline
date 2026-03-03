@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # CPU-only version
+  flow-krylov-cpu:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+    volumes:
+      - .:/app
+      - ./outputs:/app/outputs
+    working_dir: /app
+    command: python examples/validate_small_systems.py
+
+  # GPU version (requires nvidia-docker)
+  flow-krylov-gpu:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+    volumes:
+      - .:/app
+      - ./outputs:/app/outputs
+    working_dir: /app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: python examples/validate_small_systems.py
+
+  # Interactive shell
+  shell:
+    build:
+      context: .
+    volumes:
+      - .:/app
+      - ./outputs:/app/outputs
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    command: /bin/bash
