@@ -1696,7 +1696,7 @@ class MolecularHamiltonian(Hamiltonian):
         n_bra = configs_bra.shape[0]
         n_ket = configs_ket.shape[0]
 
-        H = torch.zeros(n_bra, n_ket, device=self.device)
+        H = torch.zeros(n_bra, n_ket, device=self.device, dtype=self.h1e.dtype)
 
         # Build bra hash
         bra_hash = {tuple(configs_bra[i].cpu().tolist()): i

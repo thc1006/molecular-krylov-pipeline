@@ -897,7 +897,7 @@ class PhysicsGuidedFlowTrainer:
             weighted = all_elements * ratios
 
             # Step 9: Accumulate off-diagonal contributions using scatter_add
-            off_diag = torch.zeros(n_configs, device=self.device)
+            off_diag = torch.zeros(n_configs, dtype=weighted.dtype, device=self.device)
             off_diag.scatter_add_(0, all_orig_indices, weighted)
 
             # Step 10: Total local energy = diagonal + off-diagonal
