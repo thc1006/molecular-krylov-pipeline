@@ -1263,10 +1263,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                         new_configs = new_configs[:room]
 
                 if len(new_configs) > 0:
-                    # Add new configs to basis (integer encoding matches _find_connected_configs)
+                    # Add new configs to basis (overflow-safe integer encoding)
                     current_basis = torch.cat([current_basis, new_configs], dim=0)
-                    new_ints = (new_configs.long() * powers).sum(dim=1).cpu().tolist()
-                    basis_set.update(new_ints)
+                    basis_set.update(config_integer_hash(new_configs))
 
                     # Expand state vector on GPU (new configs start with zero amplitude)
                     n_new = len(new_configs)
@@ -1340,38 +1339,48 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         else:
             indices = torch.randperm(len(basis))[:n_sample]
 
-        # B4: Use vectorized batch method if available (avoids per-config Python loop)
+        # B4: Streaming connection discovery with per-chunk dedup.
+        # Processes sampled basis in chunks to bound peak memory at ~2GB
+        # instead of materializing all connected configs at once.
+        CHUNK_SIZE = 500  # configs per chunk — bounds intermediate tensors
+
         sampled_basis = basis[indices]
-        if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
-            all_connected, _, _ = self.hamiltonian.get_connections_vectorized_batch(sampled_basis)
-        else:
-            all_connected_list = []
-            for idx in indices:
-                connected, elements = self.hamiltonian.get_connections(basis[idx])
-                if len(connected) > 0:
-                    all_connected_list.append(connected)
-            if not all_connected_list:
-                return torch.empty(0, n_sites, device=device)
-            all_connected = torch.cat(all_connected_list, dim=0)
-
-        if len(all_connected) == 0:
-            return torch.empty(0, n_sites, device=device)
-
-        # Overflow-safe integer encoding (handles n_sites >= 64)
-        connected_ints_cpu = config_integer_hash(all_connected)
-
-        # Collect ALL unique new configs (not capped yet — score first)
         new_set = set()
-        new_indices = []
-        for i, config_int in enumerate(connected_ints_cpu):
-            if config_int not in basis_set and config_int not in new_set:
-                new_set.add(config_int)
-                new_indices.append(i)
+        new_config_chunks = []
 
-        if not new_indices:
+        for chunk_start in range(0, len(sampled_basis), CHUNK_SIZE):
+            chunk = sampled_basis[chunk_start:chunk_start + CHUNK_SIZE]
+
+            if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+                chunk_connected, _, _ = self.hamiltonian.get_connections_vectorized_batch(chunk)
+            else:
+                chunk_connected_list = []
+                for c in chunk:
+                    connected, _ = self.hamiltonian.get_connections(c)
+                    if len(connected) > 0:
+                        chunk_connected_list.append(connected)
+                if not chunk_connected_list:
+                    continue
+                chunk_connected = torch.cat(chunk_connected_list, dim=0)
+
+            if len(chunk_connected) == 0:
+                continue
+
+            # Dedup this chunk against basis_set and already-found new configs
+            chunk_ints = config_integer_hash(chunk_connected)
+            chunk_new_indices = []
+            for i, h in enumerate(chunk_ints):
+                if h not in basis_set and h not in new_set:
+                    new_set.add(h)
+                    chunk_new_indices.append(i)
+
+            if chunk_new_indices:
+                new_config_chunks.append(chunk_connected[chunk_new_indices])
+
+        if not new_config_chunks:
             return torch.empty(0, n_sites, device=device)
 
-        new_configs = all_connected[new_indices]
+        new_configs = torch.cat(new_config_chunks, dim=0)
 
         # If MP2 t2 amplitudes are cached, rank by importance instead of arbitrary order
         if len(new_configs) > max_new_per_step and hasattr(self, '_mp2_t2') and self._mp2_t2 is not None:

@@ -1203,22 +1203,69 @@ class MolecularHamiltonian(Hamiltonian):
 
     @torch.no_grad()
     def get_connections_vectorized_batch(
-        self, configs: torch.Tensor
+        self, configs: torch.Tensor, max_memory_mb: float = 2048.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         GPU-accelerated batch computation of Hamiltonian connections.
 
-        Processes ALL configurations in parallel using tensor operations.
+        Processes configurations in parallel using tensor operations.
+        Auto-chunks to stay within ``max_memory_mb`` for intermediate tensors.
         This is 10-50x faster than sequential get_connections() calls for large batches.
 
         Args:
             configs: (n_configs, num_sites) basis configurations on GPU
+            max_memory_mb: memory budget for intermediate tensors (default 2048 MB)
 
         Returns:
             all_connected: (total_connections, num_sites) connected configurations
             all_elements: (total_connections,) matrix elements H[i,j]
             batch_indices: (total_connections,) index of source config for each connection
         """
+        n_configs = configs.shape[0]
+
+        # Estimate peak intermediate tensor size per config
+        n_exc_max = max(
+            len(self._single_p) if hasattr(self, '_single_p') else 0,
+            len(self._double_same_p) if hasattr(self, '_double_same_p') else 0,
+            len(self._double_ab_p) if hasattr(self, '_double_ab_p') else 0,
+        )
+        # 5 intermediate tensors × n_exc × 8 bytes per config (float64)
+        bytes_per_config = 5 * n_exc_max * 8
+        max_chunk = max(1, int(max_memory_mb * 1e6 / max(bytes_per_config, 1)))
+
+        if n_configs <= max_chunk:
+            return self._get_connections_vectorized_batch_impl(configs)
+
+        # Chunk processing to stay within memory budget
+        all_connected, all_elements, all_batch_idx = [], [], []
+        for start in range(0, n_configs, max_chunk):
+            end = min(start + max_chunk, n_configs)
+            chunk = configs[start:end]
+            c, e, b = self._get_connections_vectorized_batch_impl(chunk)
+            if len(c) > 0:
+                # Adjust batch indices to global config indices
+                all_connected.append(c)
+                all_elements.append(e)
+                all_batch_idx.append(b + start)
+
+        if not all_connected:
+            device = self.device
+            num_sites = self.num_sites
+            return (
+                torch.empty(0, num_sites, device=device),
+                torch.empty(0, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+            )
+        return (
+            torch.cat(all_connected, dim=0),
+            torch.cat(all_elements, dim=0),
+            torch.cat(all_batch_idx, dim=0),
+        )
+
+    def _get_connections_vectorized_batch_impl(
+        self, configs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Inner implementation of vectorized batch connections (no chunking)."""
         device = self.device
         configs = configs.to(device)
         n_configs = configs.shape[0]
