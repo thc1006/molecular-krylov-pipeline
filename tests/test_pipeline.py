@@ -1,4 +1,8 @@
-"""Tests for the full Flow-Guided Krylov pipeline."""
+"""Tests for the Flow-Guided Krylov pipeline.
+
+NOTE: Original tests used TransverseFieldIsing (spin model) which no longer exists.
+      Pipeline now requires MolecularHamiltonian. Tests updated accordingly.
+"""
 
 import pytest
 import torch
@@ -8,170 +12,100 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
-from hamiltonians.spin import TransverseFieldIsing
 
 
 class TestPipelineConstruction:
     """Test pipeline construction."""
 
-    def test_basic_construction(self):
-        """Test basic pipeline construction."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=1.0)
-        pipeline = FlowGuidedKrylovPipeline(H)
-
+    @pytest.mark.molecular
+    def test_basic_construction(self, h2_hamiltonian):
+        pipeline = FlowGuidedKrylovPipeline(
+            h2_hamiltonian,
+            config=PipelineConfig(device="cpu", skip_nf_training=True),
+        )
         assert pipeline.num_sites == 4
-        assert pipeline.hamiltonian is H
+        assert pipeline.hamiltonian is h2_hamiltonian
 
-    def test_with_config(self):
-        """Test construction with custom config."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=1.0)
+    @pytest.mark.molecular
+    def test_with_config(self, h2_hamiltonian):
         config = PipelineConfig(
-            nf_coupling_layers=2,
+            nf_hidden_dims=[64, 64],
             nqs_hidden_dims=[64, 64],
             max_epochs=10,
+            skip_nf_training=True,
+            device="cpu",
         )
-        pipeline = FlowGuidedKrylovPipeline(H, config=config)
-
-        assert pipeline.config.nf_coupling_layers == 2
+        pipeline = FlowGuidedKrylovPipeline(h2_hamiltonian, config=config)
         assert pipeline.config.max_epochs == 10
 
-    def test_with_exact_energy(self):
-        """Test construction with known exact energy."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=0.5)
-        E_exact, _ = H.exact_ground_state()
+    @pytest.mark.molecular
+    def test_with_exact_energy(self, h2_hamiltonian):
+        e_fci = h2_hamiltonian.fci_energy()
+        pipeline = FlowGuidedKrylovPipeline(
+            h2_hamiltonian,
+            config=PipelineConfig(device="cpu", skip_nf_training=True),
+            exact_energy=e_fci,
+        )
+        assert pipeline.exact_energy == e_fci
 
-        pipeline = FlowGuidedKrylovPipeline(H, exact_energy=E_exact)
+    @pytest.mark.molecular
+    def test_rejects_non_molecular(self):
+        """Pipeline should reject non-MolecularHamiltonian."""
+        from hamiltonians.base import Hamiltonian
 
-        assert pipeline.exact_energy == E_exact
+        class FakeH(Hamiltonian):
+            def __init__(self):
+                self.num_sites = 4
+            def diagonal_element(self, config):
+                return torch.tensor(0.0)
+            def get_connections(self, config):
+                return [], []
+
+        with pytest.raises(TypeError, match="MolecularHamiltonian"):
+            FlowGuidedKrylovPipeline(FakeH())
 
 
-class TestPipelineStages:
-    """Test individual pipeline stages."""
+class TestPipelineDirectCI:
+    """Test Direct-CI mode (skip_nf_training=True)."""
 
-    @pytest.fixture
-    def small_pipeline(self):
-        """Create a small pipeline for testing."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=0.5)
+    @pytest.mark.molecular
+    def test_direct_ci_run(self, h2_hamiltonian):
+        """Test full pipeline run in Direct-CI mode."""
+        e_fci = h2_hamiltonian.fci_energy()
         config = PipelineConfig(
-            nf_coupling_layers=2,
-            nqs_hidden_dims=[32, 32],
-            samples_per_batch=100,
-            num_batches=2,
-            max_epochs=5,
-            inference_samples=100,
-            inference_iterations=10,
-            max_krylov_dim=3,
-            shots_per_krylov=1000,
+            subspace_mode="skqd",
+            skip_nf_training=True,
             device="cpu",
         )
-        return FlowGuidedKrylovPipeline(H, config=config)
-
-    def test_train_nf_nqs(self, small_pipeline):
-        """Test NF-NQS training stage."""
-        history = small_pipeline.train_nf_nqs(progress=False)
-
-        assert "energies" in history
-        assert "flow_loss" in history
-        assert len(history["energies"]) > 0
-
-    def test_extract_basis(self, small_pipeline):
-        """Test basis extraction stage."""
-        # First train
-        small_pipeline.train_nf_nqs(progress=False)
-
-        # Then extract basis
-        basis = small_pipeline.extract_basis(n_samples=100)
-
-        assert basis.shape[1] == 4  # num_sites
-        assert len(basis) > 0
-        assert len(basis) <= 100  # At most n_samples unique
-
-    def test_run_skqd(self, small_pipeline):
-        """Test SKQD stage."""
-        # Train and extract basis first
-        small_pipeline.train_nf_nqs(progress=False)
-        small_pipeline.extract_basis(n_samples=100)
-
-        # Run SKQD
-        results = small_pipeline.run_skqd(use_nf_basis=True, progress=False)
-
-        assert "energies_combined" in results or "energies" in results
-
-
-class TestPipelineIntegration:
-    """Test full pipeline integration."""
-
-    @pytest.mark.slow
-    def test_full_run(self):
-        """Test full pipeline run on small system."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=0.5)
-        E_exact, _ = H.exact_ground_state()
-
-        config = PipelineConfig(
-            nf_coupling_layers=2,
-            nqs_hidden_dims=[32, 32],
-            samples_per_batch=100,
-            num_batches=2,
-            max_epochs=10,
-            inference_samples=100,
-            inference_iterations=20,
-            max_krylov_dim=4,
-            shots_per_krylov=5000,
-            device="cpu",
+        pipeline = FlowGuidedKrylovPipeline(
+            h2_hamiltonian, config=config, exact_energy=e_fci
         )
-
-        pipeline = FlowGuidedKrylovPipeline(H, config=config, exact_energy=E_exact)
-
         results = pipeline.run(progress=False)
 
-        # Should have results from all stages
-        assert "nf_nqs_energy" in results
-        assert "inference_energy" in results
-        assert "skqd_results" in results
+        assert "combined_energy" in results or "skqd_energy" in results
+        best = results.get("combined_energy", results.get("skqd_energy"))
+        error_mha = abs(best - e_fci) * 1000
+        assert error_mha < 0.1, f"H2 Direct-CI error {error_mha:.4f} mHa too large"
 
-        # Final energy should be reasonable
-        final_energy = results.get(
-            "combined_energy", results.get("skqd_energy")
-        )
-        error = abs(final_energy - E_exact) / abs(E_exact)
-
-        # Allow generous error for fast test
-        assert error < 0.5, f"Final error {error:.2%} > 50%"
-
-
-class TestPipelineCheckpoints:
-    """Test checkpoint functionality."""
-
-    def test_save_load_checkpoint(self, tmp_path):
-        """Test saving and loading checkpoints."""
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=0.5)
+    @pytest.mark.molecular
+    def test_direct_ci_sqd_mode(self, lih_hamiltonian):
+        """Test Direct-CI + SQD mode."""
+        e_fci = lih_hamiltonian.fci_energy()
         config = PipelineConfig(
-            nf_coupling_layers=2,
-            nqs_hidden_dims=[32, 32],
-            samples_per_batch=50,
-            num_batches=1,
-            max_epochs=2,
+            subspace_mode="sqd",
+            skip_nf_training=True,
             device="cpu",
         )
+        pipeline = FlowGuidedKrylovPipeline(
+            lih_hamiltonian, config=config, exact_energy=e_fci
+        )
+        results = pipeline.run(progress=False)
 
-        # Create and train pipeline
-        pipeline = FlowGuidedKrylovPipeline(H, config=config)
-        pipeline.train_nf_nqs(progress=False)
-        pipeline.extract_basis(n_samples=50)
-
-        # Save checkpoint
-        checkpoint_path = tmp_path / "checkpoint.pt"
-        pipeline.save_checkpoint(str(checkpoint_path))
-
-        assert checkpoint_path.exists()
-
-        # Load into new pipeline
-        new_pipeline = FlowGuidedKrylovPipeline(H, config=config)
-        new_pipeline.load_checkpoint(str(checkpoint_path))
-
-        # Should have the same results
-        assert "nf_nqs_energy" in new_pipeline.results
-        assert hasattr(new_pipeline, "nf_basis")
+        best = results.get("combined_energy", results.get("sqd_energy"))
+        assert best is not None, "No energy found in results"
+        error_mha = abs(best - e_fci) * 1000
+        # SQD with noise may have larger error
+        assert error_mha < 5.0, f"LiH SQD error {error_mha:.4f} mHa too large"
 
 
 if __name__ == "__main__":

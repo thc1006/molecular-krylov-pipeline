@@ -101,6 +101,9 @@ class SQDConfig:
     recovery_delta: float = 0.01      # Modified ReLU parameter delta
     recovery_h: float = 0.0           # Modified ReLU corner (0 = auto from filling)
 
+    # Parallelization
+    max_workers: int = 1              # Number of parallel workers for batch diag (1 = sequential)
+
 
 class SQDSolver:
     """
@@ -117,7 +120,9 @@ class SQDSolver:
         self.num_sites = hamiltonian.num_sites
 
         # Hamiltonian cache: avoids rebuilding H matrix for identical batches
-        # across self-consistent iterations (B1 optimization)
+        # across self-consistent iterations (B1 optimization).
+        # Note: accessed by ThreadPoolExecutor workers, but safe under CPython GIL
+        # because each batch has a unique hash (no concurrent writes to same key).
         self._h_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Molecular properties
@@ -236,14 +241,48 @@ class SQDSolver:
             # Create K batches
             batches = self._create_batches(all_configs, batch_size, cfg.num_batches)
 
-            # Diagonalize each batch
-            batch_results = []
-            for k, batch in enumerate(batches):
-                result = self._diagonalize_batch(batch, k)
-                batch_results.append(result)
+            # Diagonalize each batch (parallel when max_workers > 1)
+            if cfg.max_workers > 1 and len(batches) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                import os
+                # Prevent BLAS thread oversubscription: each worker uses 1 BLAS thread
+                old_omp = os.environ.get('OMP_NUM_THREADS')
+                old_openblas = os.environ.get('OPENBLAS_NUM_THREADS')
+                os.environ['OMP_NUM_THREADS'] = '1'
+                os.environ['OPENBLAS_NUM_THREADS'] = '1'
+                try:
+                    n_workers = min(cfg.max_workers, len(batches))
+                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                        futures = {
+                            pool.submit(self._diagonalize_batch, batch, k): k
+                            for k, batch in enumerate(batches)
+                        }
+                        batch_results = [None] * len(batches)
+                        for future in futures:
+                            k = futures[future]
+                            batch_results[k] = future.result()
+                finally:
+                    # Restore BLAS thread settings
+                    if old_omp is not None:
+                        os.environ['OMP_NUM_THREADS'] = old_omp
+                    else:
+                        os.environ.pop('OMP_NUM_THREADS', None)
+                    if old_openblas is not None:
+                        os.environ['OPENBLAS_NUM_THREADS'] = old_openblas
+                    else:
+                        os.environ.pop('OPENBLAS_NUM_THREADS', None)
                 if progress:
-                    print(f"    Batch {k+1}: E = {result['energy']:.8f} Ha "
-                          f"({len(batch)} configs, var = {result['variance']:.2e})")
+                    for k, result in enumerate(batch_results):
+                        print(f"    Batch {k+1}: E = {result['energy']:.8f} Ha "
+                              f"({result['batch_size']} configs, var = {result['variance']:.2e})")
+            else:
+                batch_results = []
+                for k, batch in enumerate(batches):
+                    result = self._diagonalize_batch(batch, k)
+                    batch_results.append(result)
+                    if progress:
+                        print(f"    Batch {k+1}: E = {result['energy']:.8f} Ha "
+                              f"({len(batch)} configs, var = {result['variance']:.2e})")
 
             # Compute orbital occupancies from eigenstates
             new_occ = self._compute_orbital_occupancies(batch_results)
@@ -534,13 +573,32 @@ class SQDSolver:
                 cfg[a + n_orb] = 1
                 essential.append(cfg)
 
-        # Double excitations (capped for large systems)
+        # Double excitations with proportional allocation per type.
+        # αβ doubles dominate correlation energy — each type gets a fair
+        # share proportional to its total count, with αβ guaranteed >= 50%.
         max_doubles = 5000
-        doubles_count = 0
+        from math import comb as _comb
+        n_aa_total = _comb(n_alpha, 2) * _comb(len(virt_alpha), 2)
+        n_bb_total = _comb(n_beta, 2) * _comb(len(virt_beta), 2)
+        n_ab_total = n_alpha * n_beta * len(virt_alpha) * len(virt_beta)
+        total_possible = n_aa_total + n_bb_total + n_ab_total
 
+        if total_possible <= max_doubles:
+            max_aa = n_aa_total
+            max_bb = n_bb_total
+            max_ab = n_ab_total
+        else:
+            ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
+            remaining_frac = 1.0 - ab_frac
+            aa_frac = remaining_frac * (n_aa_total / (n_aa_total + n_bb_total)) if (n_aa_total + n_bb_total) > 0 else 0
+            max_ab = int(ab_frac * max_doubles)
+            max_aa = int(aa_frac * max_doubles)
+            max_bb = max_doubles - max_ab - max_aa
+
+        aa_count = 0
         for i, j in combinations(occ_alpha, 2):
             for a, b in combinations(virt_alpha, 2):
-                if doubles_count >= max_doubles:
+                if aa_count >= max_aa:
                     break
                 cfg = hf_state.clone()
                 cfg[i] = 0
@@ -548,11 +606,14 @@ class SQDSolver:
                 cfg[a] = 1
                 cfg[b] = 1
                 essential.append(cfg)
-                doubles_count += 1
+                aa_count += 1
+            if aa_count >= max_aa:
+                break
 
+        bb_count = 0
         for i, j in combinations(occ_beta, 2):
             for a, b in combinations(virt_beta, 2):
-                if doubles_count >= max_doubles:
+                if bb_count >= max_bb:
                     break
                 cfg = hf_state.clone()
                 cfg[i + n_orb] = 0
@@ -560,13 +621,16 @@ class SQDSolver:
                 cfg[a + n_orb] = 1
                 cfg[b + n_orb] = 1
                 essential.append(cfg)
-                doubles_count += 1
+                bb_count += 1
+            if bb_count >= max_bb:
+                break
 
+        ab_count = 0
         for i in occ_alpha:
             for j in occ_beta:
                 for a in virt_alpha:
                     for b in virt_beta:
-                        if doubles_count >= max_doubles:
+                        if ab_count >= max_ab:
                             break
                         cfg = hf_state.clone()
                         cfg[i] = 0
@@ -574,7 +638,13 @@ class SQDSolver:
                         cfg[a] = 1
                         cfg[b + n_orb] = 1
                         essential.append(cfg)
-                        doubles_count += 1
+                        ab_count += 1
+                    if ab_count >= max_ab:
+                        break
+                if ab_count >= max_ab:
+                    break
+            if ab_count >= max_ab:
+                break
 
         return torch.unique(torch.stack(essential).to(device), dim=0)
 
@@ -740,11 +810,12 @@ class SQDSolver:
             ground_state = torch.ones(1, dtype=H_work.dtype, device=device)
         else:
             try:
+                use_gpu = device.type == 'cuda'
                 if gpu_eigsh is not None:
                     k_eig = min(2, n - 1)
-                    eigenvalues, eigenvectors = gpu_eigsh(H_work, k=k_eig, which='SA', use_gpu=True)
+                    eigenvalues, eigenvectors = gpu_eigsh(H_work, k=k_eig, which='SA', use_gpu=use_gpu)
                 elif gpu_eigh is not None:
-                    eigenvalues, eigenvectors = gpu_eigh(H_work, use_gpu=True)
+                    eigenvalues, eigenvectors = gpu_eigh(H_work, use_gpu=use_gpu)
                 else:
                     raise RuntimeError("No GPU eigensolver available")
 

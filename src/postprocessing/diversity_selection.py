@@ -70,6 +70,171 @@ def compute_hamming_distance(
     return (config1 != config2).sum().item()
 
 
+def bitpack_configs(configs: torch.Tensor) -> torch.Tensor:
+    """Pack binary configs into int64 for O(1) Hamming via XOR + popcount.
+
+    Each config (up to 64 sites) is packed into a single int64.
+    Hamming distance = popcount(a XOR b).
+
+    Args:
+        configs: (n, sites) binary tensor, sites <= 64
+
+    Returns:
+        (n,) int64 tensor of packed configs
+    """
+    n, sites = configs.shape
+    assert sites <= 64, f"Bitpacking supports up to 64 sites, got {sites}"
+    powers = (1 << torch.arange(sites, dtype=torch.int64)).flip(0)
+    return (configs.long() * powers).sum(dim=1)
+
+
+def hamming_bitpacked(a, b) -> int:
+    """Hamming distance between two bitpacked configs. O(1)."""
+    # Convert torch tensors to Python int via raw bytes to avoid int64 overflow
+    # in older PyTorch versions (2.5 etc.) where .item() raises on large uint values
+    if hasattr(a, 'numpy'):
+        a = int.from_bytes(a.cpu().numpy().tobytes(), byteorder='little', signed=True)
+    if hasattr(b, 'numpy'):
+        b = int.from_bytes(b.cpu().numpy().tobytes(), byteorder='little', signed=True)
+    # Mask to 64 bits to handle signed int64 correctly (Python bin(-x) gives '-0b...')
+    return bin((a ^ b) & 0xFFFFFFFFFFFFFFFF).count('1')
+
+
+def hamming_bitpacked_batch(packed: torch.Tensor, idx: int, indices: torch.Tensor) -> torch.Tensor:
+    """Hamming distance from packed[idx] to packed[indices]. Vectorized O(k)."""
+    xor = packed[indices] ^ packed[idx]
+    return _popcount_int64(xor)
+
+
+# Byte-level popcount lookup table (0-255)
+_POPCOUNT_TABLE = torch.zeros(256, dtype=torch.int32)
+for _i in range(256):
+    _POPCOUNT_TABLE[_i] = bin(_i).count('1')
+_POPCOUNT_TABLE_CACHE: dict = {}  # device -> table tensor
+
+
+def _popcount_int64(x: torch.Tensor) -> torch.Tensor:
+    """Vectorized popcount for int64 tensor using byte lookup table."""
+    # Cache table per device to avoid repeated .to() calls in hot loops
+    dev = x.device
+    if dev not in _POPCOUNT_TABLE_CACHE:
+        _POPCOUNT_TABLE_CACHE[dev] = _POPCOUNT_TABLE.to(dev)
+    table = _POPCOUNT_TABLE_CACHE[dev]
+
+    # view(uint8) requires at least 1-dim; unsqueeze scalar tensors
+    was_scalar = x.dim() == 0
+    if was_scalar:
+        x = x.unsqueeze(0)
+
+    # View as uint8 bytes (8 bytes per int64), sum popcount per byte
+    shape = x.shape
+    x_bytes = x.contiguous().view(torch.uint8)  # flatten to bytes
+    counts = table[x_bytes.long()]  # lookup each byte
+    # Reshape to (original_shape..., 8) and sum over last dim
+    counts = counts.reshape(*shape, 8).sum(dim=-1)
+    result = counts.int()
+    if was_scalar:
+        result = result.squeeze(0)
+    return result
+
+
+def stochastic_greedy_select(
+    configs: torch.Tensor,
+    weights: torch.Tensor,
+    n_select: int,
+    epsilon: float = 0.01,
+    min_hamming: int = 0,
+    seed: int = 42,
+) -> torch.Tensor:
+    """Stochastic greedy diversity selection (Mirzasoleiman et al., AAAI 2015).
+
+    Instead of evaluating ALL n candidates at each step (O(n*k)),
+    samples a random subset of size (n/k)*ln(1/epsilon) and picks the best.
+    Total evaluations: O(n * ln(1/epsilon)) instead of O(n*k).
+
+    For n=50K, k=5K, epsilon=0.01: ~230K evals instead of 250M (~1000x faster).
+
+    Args:
+        configs: (n, sites) binary configs
+        weights: (n,) importance weights
+        n_select: number of configs to select
+        epsilon: approximation parameter (smaller = better quality, more evals)
+        min_hamming: minimum Hamming distance between selected configs
+        seed: random seed
+
+    Returns:
+        (n_select,) tensor of selected indices
+    """
+    import math
+
+    n = len(configs)
+    n_select = min(n_select, n)
+
+    if n_select <= 0:
+        return torch.tensor([], dtype=torch.long)
+
+    # Bitpack for fast Hamming
+    packed = bitpack_configs(configs)
+
+    # Sample size per step: (n/k) * ln(1/eps)
+    sample_size = max(1, int((n / max(n_select, 1)) * math.log(1.0 / epsilon)))
+    sample_size = min(sample_size, n)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+
+    selected = []
+    selected_mask = torch.zeros(n, dtype=torch.bool)
+    # Track min distance from each candidate to selected set
+    min_dists = torch.full((n,), fill_value=999999, dtype=torch.int32)
+
+    # Start with highest-weight config
+    first = weights.argmax().item()
+    selected.append(first)
+    selected_mask[first] = True
+
+    # Update min_dists from first selected — vectorized
+    xor = packed ^ packed[first]
+    dists = _popcount_int64(xor)
+    min_dists = dists
+    min_dists[first] = 0  # self-distance irrelevant, masked by selected_mask
+
+    while len(selected) < n_select:
+        # Get remaining indices
+        remaining_indices = torch.where(~selected_mask)[0]
+        if len(remaining_indices) == 0:
+            break
+
+        # Sample subset
+        actual_sample_size = min(sample_size, len(remaining_indices))
+        perm = torch.randperm(len(remaining_indices), generator=gen)[:actual_sample_size]
+        candidates = remaining_indices[perm]
+
+        # Score candidates vectorized: weight * max(min_dist, 1)
+        cand_dists = min_dists[candidates].float()
+        cand_weights = weights[candidates]
+        scores = cand_weights * torch.clamp(cand_dists, min=1.0)
+
+        # Penalize candidates below min_hamming (only if any valid alternatives exist)
+        if min_hamming > 0:
+            valid = cand_dists >= min_hamming
+            if valid.any():
+                scores[~valid] = -float('inf')
+
+        best_local = scores.argmax().item()
+        best_idx = candidates[best_local].item()
+
+        selected.append(best_idx)
+        selected_mask[best_idx] = True
+
+        # Update min_dists incrementally — vectorized XOR + popcount
+        xor = packed ^ packed[best_idx]
+        new_dists = _popcount_int64(xor)
+        min_dists = torch.minimum(min_dists, new_dists)
+
+    return torch.tensor(selected, dtype=torch.long)
+
+
 def compute_hamming_distance_matrix(
     configs: torch.Tensor,
 ) -> torch.Tensor:

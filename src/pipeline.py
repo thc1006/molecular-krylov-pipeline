@@ -440,14 +440,35 @@ class FlowGuidedKrylovPipeline:
                 new_config[a + n_orb] = 1
                 essential.append(new_config)
 
-        # Double excitations (with limit for large systems)
+        # Double excitations with proportional allocation per type.
+        # αβ doubles dominate correlation energy, so each type gets a fair
+        # share proportional to its total count, with αβ guaranteed >= 50%.
         max_doubles = 5000
-        doubles_count = 0
+        from math import comb as _comb
+        n_aa_total = _comb(n_alpha, 2) * _comb(len(virt_alpha), 2)
+        n_bb_total = _comb(n_beta, 2) * _comb(len(virt_beta), 2)
+        n_ab_total = n_alpha * n_beta * len(virt_alpha) * len(virt_beta)
+        total_possible = n_aa_total + n_bb_total + n_ab_total
+
+        if total_possible <= max_doubles:
+            max_aa = n_aa_total
+            max_bb = n_bb_total
+            max_ab = n_ab_total
+        else:
+            # Proportional allocation with αβ floor of 50%
+            ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
+            remaining_frac = 1.0 - ab_frac
+            aa_frac = remaining_frac * (n_aa_total / (n_aa_total + n_bb_total)) if (n_aa_total + n_bb_total) > 0 else 0
+            bb_frac = remaining_frac - aa_frac
+            max_ab = int(ab_frac * max_doubles)
+            max_aa = int(aa_frac * max_doubles)
+            max_bb = max_doubles - max_ab - max_aa
 
         # Alpha-alpha doubles
+        aa_count = 0
         for i, j in combinations(occ_alpha, 2):
             for a, b in combinations(virt_alpha, 2):
-                if doubles_count >= max_doubles:
+                if aa_count >= max_aa:
                     break
                 new_config = hf_state.clone()
                 new_config[i] = 0
@@ -455,14 +476,15 @@ class FlowGuidedKrylovPipeline:
                 new_config[a] = 1
                 new_config[b] = 1
                 essential.append(new_config)
-                doubles_count += 1
-            if doubles_count >= max_doubles:
+                aa_count += 1
+            if aa_count >= max_aa:
                 break
 
         # Beta-beta doubles
+        bb_count = 0
         for i, j in combinations(occ_beta, 2):
             for a, b in combinations(virt_beta, 2):
-                if doubles_count >= max_doubles:
+                if bb_count >= max_bb:
                     break
                 new_config = hf_state.clone()
                 new_config[i + n_orb] = 0
@@ -470,16 +492,17 @@ class FlowGuidedKrylovPipeline:
                 new_config[a + n_orb] = 1
                 new_config[b + n_orb] = 1
                 essential.append(new_config)
-                doubles_count += 1
-            if doubles_count >= max_doubles:
+                bb_count += 1
+            if bb_count >= max_bb:
                 break
 
         # Alpha-beta doubles (most important for correlation)
+        ab_count = 0
         for i in occ_alpha:
             for j in occ_beta:
                 for a in virt_alpha:
                     for b in virt_beta:
-                        if doubles_count >= max_doubles:
+                        if ab_count >= max_ab:
                             break
                         new_config = hf_state.clone()
                         new_config[i] = 0
@@ -487,12 +510,12 @@ class FlowGuidedKrylovPipeline:
                         new_config[a] = 1
                         new_config[b + n_orb] = 1
                         essential.append(new_config)
-                        doubles_count += 1
-                    if doubles_count >= max_doubles:
+                        ab_count += 1
+                    if ab_count >= max_ab:
                         break
-                if doubles_count >= max_doubles:
+                if ab_count >= max_ab:
                     break
-            if doubles_count >= max_doubles:
+            if ab_count >= max_ab:
                 break
 
         essential_tensor = torch.stack(essential).to(self.device)

@@ -41,10 +41,10 @@ except ImportError:
 # Support both package imports and direct script execution
 try:
     from ..hamiltonians.base import Hamiltonian
-    from ..utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    from ..utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply, mixed_precision_eigh
 except ImportError:
     from hamiltonians.base import Hamiltonian
-    from utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    from utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply, mixed_precision_eigh
 
 
 @dataclass
@@ -104,6 +104,10 @@ class SampleBasedKrylovDiagonalization:
         initial_state: Optional initial state (default: HF state)
     """
 
+    # Guard: systems larger than this skip full subspace enumeration
+    # to prevent OOM. Matches FlowGuidedSKQD.MAX_FULL_SUBSPACE_SIZE.
+    MAX_FULL_SUBSPACE_SIZE = 100000
+
     def __init__(
         self,
         hamiltonian: Hamiltonian,
@@ -156,6 +160,13 @@ class SampleBasedKrylovDiagonalization:
         n_valid = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
         print(f"Setting up particle-conserving subspace: {n_valid:,} configs "
               f"(vs {self.hamiltonian.hilbert_dim:,} full Hilbert space)")
+
+        if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
+            print(f"WARNING: {n_valid:,} configs exceeds MAX_FULL_SUBSPACE_SIZE "
+                  f"({self.MAX_FULL_SUBSPACE_SIZE:,}). Skipping full subspace enumeration.")
+            self._subspace_basis = None
+            self._subspace_index_map = None
+            return
 
         # Generate all valid configurations
         alpha_configs = list(combinations(range(n_orb), n_alpha))
@@ -521,7 +532,8 @@ class SampleBasedKrylovDiagonalization:
 
     def _bitstring_to_tensor(self, bitstring: str) -> torch.Tensor:
         """Convert bitstring to tensor configuration."""
-        return torch.tensor([int(b) for b in bitstring], dtype=torch.long)
+        return torch.tensor([int(b) for b in bitstring], dtype=torch.long,
+                            device=self.hamiltonian.device)
 
     def generate_krylov_samples(
         self,
@@ -726,6 +738,8 @@ class SampleBasedKrylovDiagonalization:
         basis: Optional[torch.Tensor] = None,
         return_eigenvector: bool = False,
         regularization: float = 1e-8,
+        shift_invert: bool = False,
+        mixed_precision: bool = False,
     ) -> Tuple[float, Optional[torch.Tensor]]:
         """
         Compute ground state energy via subspace diagonalization.
@@ -745,6 +759,8 @@ class SampleBasedKrylovDiagonalization:
             basis: Basis states to use (default: use all sampled states)
             return_eigenvector: Whether to return ground state coefficients
             regularization: Small value added to diagonal for stability
+            mixed_precision: If True, use FP32 eigh + FP64 Rayleigh refinement
+                for ~100x speedup on DGX Spark GB10 (TF32 vs FP64)
 
         Returns:
             (ground_energy, ground_state_coefficients) if return_eigenvector
@@ -764,10 +780,18 @@ class SampleBasedKrylovDiagonalization:
             basis = basis[:max_diag]
             print(f"  Capped basis from {original_size} to {max_diag} configs for diagonalization")
 
-        # Build projected Hamiltonian (stays on GPU)
+        n = len(basis)
+        device = basis.device
+
+        # Use sparse path for large bases to avoid O(n²) dense matrix
+        SPARSE_THRESHOLD = 3000
+        if n >= SPARSE_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+            return self._sparse_ground_state(
+                basis, return_eigenvector, regularization, shift_invert=shift_invert
+            )
+
+        # Dense path: build projected Hamiltonian
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
-        n = H_proj.shape[0]
-        device = H_proj.device
 
         # Use float64 for numerical stability (GPU supports double precision)
         H = H_proj.detach().double()
@@ -802,14 +826,21 @@ class SampleBasedKrylovDiagonalization:
 
         # GPU-accelerated eigensolver — stays entirely on GPU
         # gpu_eigsh uses dense torch.linalg.eigh for n <= 10000, CuPy sparse for larger
+        use_gpu = device.type == 'cuda'
         try:
-            if n >= 2:
+            if mixed_precision:
+                # FP32 eigh + FP64 Rayleigh quotient refinement
+                # ~100x speedup on DGX Spark GB10 (TF32 vs FP64)
+                eigenvalues, eigenvectors = mixed_precision_eigh(H, use_gpu=use_gpu)
+                E0 = float(eigenvalues[0].cpu())
+                v0 = eigenvectors[:, 0] if return_eigenvector else None
+            elif n >= 2:
                 k_eig = min(2, n - 1)
-                eigenvalues, eigenvectors = gpu_eigsh(H, k=k_eig, which='SA', use_gpu=True)
+                eigenvalues, eigenvectors = gpu_eigsh(H, k=k_eig, which='SA', use_gpu=use_gpu)
                 E0 = float(eigenvalues[0].cpu())
                 v0 = eigenvectors[:, 0] if return_eigenvector else None
             else:
-                eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
+                eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=use_gpu)
                 E0 = float(eigenvalues[0].cpu())
                 v0 = eigenvectors[:, 0] if return_eigenvector else None
         except Exception as e:
@@ -869,6 +900,90 @@ class SampleBasedKrylovDiagonalization:
 
         E0 = float(eigenvalues[0].cpu())
         v0 = eigenvectors[:, 0]
+
+        if return_eigenvector:
+            return E0, v0
+        else:
+            return E0, None
+
+    def _sparse_ground_state(
+        self,
+        basis: torch.Tensor,
+        return_eigenvector: bool = False,
+        regularization: float = 0.0,
+        shift_invert: bool = False,
+    ) -> Tuple[float, Optional[torch.Tensor]]:
+        """
+        Compute ground state using sparse Hamiltonian construction + scipy.sparse.eigsh.
+
+        Avoids O(n²) dense matrix construction for large bases.
+        Uses get_sparse_matrix_elements() for off-diagonals + diagonal_element() for diagonal.
+
+        Args:
+            shift_invert: If True, use shift-invert mode with sigma=E_hf.
+                This finds eigenvalues near sigma via (H - sigma*I)^{-1},
+                converging faster when sigma is close to the ground state.
+        """
+        from scipy.sparse import coo_matrix, csr_matrix
+        from scipy.sparse.linalg import eigsh
+
+        n = len(basis)
+        device = basis.device
+        mode_str = "shift-invert" if shift_invert else "standard"
+        print(f"  Using sparse eigensolver ({mode_str}) for {n} configs")
+
+        # Get sparse off-diagonal elements
+        rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+        rows_np = rows.cpu().numpy()
+        cols_np = cols.cpu().numpy()
+        vals_np = vals.cpu().numpy().astype(np.float64)
+
+        # Build sparse matrix (off-diagonal)
+        H_sparse = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+
+        # Add diagonal elements
+        diag_vals = np.array([
+            self.hamiltonian.diagonal_element(basis[i]).item()
+            for i in range(n)
+        ], dtype=np.float64)
+
+        if regularization > 0:
+            diag_vals += regularization
+
+        from scipy.sparse import diags
+        # get_sparse_matrix_elements already returns BOTH (i,j) and (j,i) entries.
+        # COO sums duplicates, so H_sparse already has correct off-diagonal values.
+        # Just symmetrize to handle any floating-point asymmetry, then add diagonal.
+        H_csr = H_sparse.tocsr()
+        H_csr = 0.5 * (H_csr + H_csr.T)
+        H_csr = H_csr + diags(diag_vals, 0, shape=(n, n), format='csr')
+
+        # Sparse eigensolver
+        try:
+            k_eig = min(2, n - 1) if n >= 2 else 1
+
+            if shift_invert:
+                # Shift-invert: solve (H - sigma*I)^{-1} to find eigenvalues
+                # near sigma. Using which='SA' returns the algebraically smallest
+                # eigenvalues, i.e., the ground state.
+                sigma = float(self.hamiltonian.diagonal_element(
+                    self.hamiltonian.get_hf_state()
+                ).item())
+                eigenvalues, eigenvectors = eigsh(
+                    H_csr, k=k_eig, sigma=sigma, which='SA'
+                )
+                E0 = float(eigenvalues[0])
+                v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+            else:
+                eigenvalues, eigenvectors = eigsh(H_csr, k=k_eig, which='SA')
+                E0 = float(eigenvalues[0])
+                v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+        except Exception as e:
+            print(f"  Sparse eigsh failed ({e}), falling back to dense")
+            H_dense = H_csr.toarray()
+            eigenvalues, eigenvectors = np.linalg.eigh(H_dense)
+            E0 = float(eigenvalues[0])
+            v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
 
         if return_eigenvector:
             return E0, v0

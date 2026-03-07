@@ -137,6 +137,100 @@ def gpu_eigsh(
         raise ValueError(f"Unknown which={which}")
 
 
+def mixed_precision_eigh(
+    H: torch.Tensor,
+    use_gpu: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Mixed-precision eigendecomposition: FP32 solve + FP64 Rayleigh quotient refinement.
+
+    DGX Spark GB10 has FP64=0.48 TFLOPS but TF32=53 TFLOPS (110x ratio).
+    Strategy:
+      1. Solve eigh in FP32 (uses TF32 matmul on GPU, ~100x faster)
+      2. Refine eigenvalues via FP64 Rayleigh quotient: E_i = v_i^T H_64 v_i / (v_i^T v_i)
+      3. Return FP64-refined eigenvalues with FP64-upcast eigenvectors
+
+    For small matrices or already-FP64 input, falls back to standard FP64 eigh
+    since FP32 rounding offers no speedup benefit.
+
+    Args:
+        H: Hermitian matrix (n, n) — real or complex, any dtype
+        use_gpu: If True, keep computation on GPU
+
+    Returns:
+        eigenvalues: (n,) tensor of FP64-refined eigenvalues in ascending order
+        eigenvectors: (n, n) tensor of eigenvectors (FP64)
+    """
+    device = H.device
+
+    # Move to correct device
+    if use_gpu and torch.cuda.is_available() and not H.is_cuda:
+        H = H.cuda()
+    elif not use_gpu and H.is_cuda:
+        H = H.cpu()
+
+    # For very small matrices (n <= 64), FP32 rounding noise is negligible
+    # and the overhead of two solves isn't worth it. Use FP64 directly.
+    n = H.shape[0]
+    if n <= 64:
+        return gpu_eigh(H, use_gpu=use_gpu)
+
+    # Determine FP32/FP64 dtype pairs based on real vs complex input
+    is_complex = H.is_complex()
+    if is_complex:
+        low_dtype = torch.complex64
+        high_dtype = torch.complex128
+    else:
+        low_dtype = torch.float32
+        high_dtype = torch.float64
+
+    # Keep FP64 copy for Rayleigh refinement
+    H_fp64 = H.to(high_dtype)
+
+    # Symmetrize for numerical stability
+    if is_complex:
+        H_fp64 = 0.5 * (H_fp64 + H_fp64.conj().T)
+    else:
+        H_fp64 = 0.5 * (H_fp64 + H_fp64.T)
+
+    # Step 1: Solve in FP32 (leverages TF32 matmul on Ampere+ GPUs)
+    H_fp32 = H_fp64.to(low_dtype)
+    try:
+        evals_fp32, evecs_fp32 = torch.linalg.eigh(H_fp32)
+    except Exception:
+        # FP32 eigh failed (e.g., severe ill-conditioning) — fall back to FP64
+        evals_fp64, evecs_fp64 = torch.linalg.eigh(H_fp64)
+        return evals_fp64, evecs_fp64
+
+    # Step 2: Upcast eigenvectors to FP64
+    evecs_fp64 = evecs_fp32.to(high_dtype)
+
+    # Step 3: FP64 Rayleigh quotient refinement
+    # E_i = v_i^T H_64 v_i / (v_i^T v_i)
+    # This recovers FP64 accuracy from FP32 eigenvectors because the
+    # Rayleigh quotient is stationary at exact eigenvectors, so first-order
+    # errors in v cancel out, giving second-order accurate energies.
+    Hv = H_fp64 @ evecs_fp64  # (n, n) @ (n, n) = (n, n)
+
+    # Compute Rayleigh quotient for each eigenvector
+    if is_complex:
+        # For complex: E_i = Re(v_i^H @ H @ v_i) / (v_i^H @ v_i)
+        numerator = (evecs_fp64.conj() * Hv).sum(dim=0).real
+        denominator = (evecs_fp64.conj() * evecs_fp64).sum(dim=0).real
+    else:
+        numerator = (evecs_fp64 * Hv).sum(dim=0)
+        denominator = (evecs_fp64 * evecs_fp64).sum(dim=0)
+
+    evals_refined = numerator / denominator
+
+    # Sort by eigenvalue (FP32 ordering should be correct, but refine may shift)
+    sort_idx = evals_refined.argsort()
+    evals_refined = evals_refined[sort_idx]
+    evecs_fp64 = evecs_fp64[:, sort_idx]
+
+    return evals_refined, evecs_fp64
+
+
 def gpu_expm_multiply(
     A: torch.Tensor,
     v: torch.Tensor,
