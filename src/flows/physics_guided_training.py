@@ -16,6 +16,7 @@ References:
 - Importance sampling: configurations with low local energy matter more
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,7 +59,7 @@ class PhysicsGuidedConfig:
     # Loss weights
     teacher_weight: float = 1.0  # Cross-entropy (paper's main term)
     physics_weight: float = 0.0  # Variational energy gradient (optional)
-    entropy_weight: float = 0.01  # Entropy bonus to prevent mode collapse
+    entropy_weight: float = 0.05  # Entropy bonus to prevent mode collapse
 
     # Energy baseline for physics signal
     use_energy_baseline: bool = True  # Subtract baseline for variance reduction
@@ -501,11 +502,15 @@ class PhysicsGuidedFlowTrainer:
         pbar = tqdm(range(config.num_epochs), desc="Training")
 
         for epoch in pbar:
-            # Temperature annealing for particle-conserving flow
+            # Temperature annealing for particle-conserving flow (exponential decay)
+            # T(e) = T_final + (T_init - T_final) * exp(-rate * e)
+            # Rate chosen so T ≈ T_final + 0.01*(T_init-T_final) at decay_epochs
             if hasattr(self.flow, 'set_temperature'):
-                progress = min(1.0, epoch / config.temperature_decay_epochs)
-                temperature = config.initial_temperature + progress * (
-                    config.final_temperature - config.initial_temperature
+                decay_rate = math.log(100) / max(config.temperature_decay_epochs, 1)
+                temperature = (
+                    config.final_temperature
+                    + (config.initial_temperature - config.final_temperature)
+                    * math.exp(-decay_rate * epoch)
                 )
                 self.flow.set_temperature(temperature)
 
@@ -1090,19 +1095,20 @@ class PhysicsGuidedFlowTrainer:
         # H(flow) = -sum p_flow * log p_flow
         entropy = -torch.sum(flow_probs * log_flow_probs)
 
-        # Combined loss
-        total_loss = (
-            config.teacher_weight * teacher_loss +
-            config.physics_weight * physics_loss -
-            config.entropy_weight * entropy
-        )
-
-        # Scale by energy magnitude (paper Eq. 16)
-        # Use batch_size as denominator (fixed), NOT |S| (unique count).
-        # |E|/|S| punishes diversity: collapsed flow (|S|=1) gets 1000x more
-        # gradient than diverse flow (|S|=1000), directly incentivizing collapse.
+        # Combined loss: entropy is a regularizer independent of energy scale,
+        # so it must NOT be multiplied by |E|/batch_size. Only teacher and physics
+        # losses scale with energy magnitude (paper Eq. 16).
         batch_size = len(configs)
-        total_loss = total_loss * torch.abs(energy.detach()) / batch_size
+        energy_scale = torch.abs(energy.detach()) / batch_size
+
+        # Scale teacher + physics by energy magnitude
+        scaled_loss = (
+            config.teacher_weight * teacher_loss +
+            config.physics_weight * physics_loss
+        ) * energy_scale
+
+        # Entropy is added separately, unscaled — it's a pure regularizer
+        total_loss = scaled_loss - config.entropy_weight * entropy
 
         components = {
             'teacher': teacher_loss,
