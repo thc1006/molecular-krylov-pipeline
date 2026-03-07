@@ -74,8 +74,8 @@ class PhysicsGuidedConfig:
 
     # Temperature annealing for particle-conserving flow
     initial_temperature: float = 1.0
-    final_temperature: float = 0.1
-    temperature_decay_epochs: int = 200
+    final_temperature: float = 0.3
+    temperature_decay_epochs: int = 400
 
     # Connection caching for avoiding recomputation
     use_connection_cache: bool = True
