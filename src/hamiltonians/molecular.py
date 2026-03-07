@@ -18,6 +18,388 @@ try:
 except ImportError:
     from hamiltonians.base import Hamiltonian
 
+try:
+    import numba
+    from numba import njit, int64, float64, int32
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+# =============================================================================
+# Numba JIT-compiled functions for get_connections acceleration
+# These are module-level pure functions (no class state) for Numba compatibility.
+# =============================================================================
+
+if NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def numba_jw_sign_single(config, p, q):
+        """
+        JW sign for single excitation a+_p a_q.
+
+        Sign = (-1)^(number of occupied sites between p and q).
+        """
+        if p == q:
+            return 1
+        low = min(p, q)
+        high = max(p, q)
+        count = 0
+        for i in range(low + 1, high):
+            count += config[i]
+        if (count & 1) == 0:
+            return 1
+        return -1
+
+    @njit(cache=True)
+    def numba_jw_sign_double(config, p, r, q, s):
+        """
+        JW sign for double excitation a+_p a+_r a_s a_q.
+
+        Operators applied RIGHT-TO-LEFT:
+        1. a_q (annihilate q) on original config
+        2. a_s (annihilate s) on config with q removed
+        3. a+_r (create r) on config with q,s removed
+        4. a+_p (create p) on config with q,s removed, r added
+        """
+        total_count = 0
+
+        # 1. a_q: count occupied below q
+        c_q = 0
+        for i in range(q):
+            c_q += config[i]
+        total_count += c_q
+
+        # 2. a_s: count occupied below s, adjust for q removal
+        c_s = 0
+        for i in range(s):
+            c_s += config[i]
+        if q < s:
+            c_s -= 1
+        total_count += c_s
+
+        # 3. a+_r: count occupied below r, adjust for q,s removal
+        c_r = 0
+        for i in range(r):
+            c_r += config[i]
+        if q < r:
+            c_r -= 1
+        if s < r:
+            c_r -= 1
+        total_count += c_r
+
+        # 4. a+_p: count occupied below p, adjust for q,s removal and r addition
+        c_p = 0
+        for i in range(p):
+            c_p += config[i]
+        if q < p:
+            c_p -= 1
+        if s < p:
+            c_p -= 1
+        if r < p:
+            c_p += 1
+        total_count += c_p
+
+        if (total_count & 1) == 0:
+            return 1
+        return -1
+
+    @njit(cache=True)
+    def _numba_single_excitations(
+        config, n_orb, J_single, K_single,
+        single_exc_pq, single_exc_hpq,
+    ):
+        """
+        Compute all single excitation connections and matrix elements.
+
+        Returns:
+            conns: list of new configs (numpy arrays)
+            elems: list of matrix element values (float64)
+        """
+        n_sites = len(config)
+
+        # Find occupied/virtual orbitals
+        occ_alpha = np.empty(n_orb, dtype=np.int64)
+        n_occ_a = 0
+        virt_alpha = np.empty(n_orb, dtype=np.int64)
+        n_virt_a = 0
+        for i in range(n_orb):
+            if config[i] == 1:
+                occ_alpha[n_occ_a] = i
+                n_occ_a += 1
+            else:
+                virt_alpha[n_virt_a] = i
+                n_virt_a += 1
+
+        occ_beta = np.empty(n_orb, dtype=np.int64)
+        n_occ_b = 0
+        virt_beta = np.empty(n_orb, dtype=np.int64)
+        n_virt_b = 0
+        for i in range(n_orb):
+            if config[i + n_orb] == 1:
+                occ_beta[n_occ_b] = i
+                n_occ_b += 1
+            else:
+                virt_beta[n_virt_b] = i
+                n_virt_b += 1
+
+        # Pre-allocate (upper bound: n_exc * 2 for alpha + beta)
+        max_conns = len(single_exc_pq) * 2
+        conn_buf = np.empty((max_conns, n_sites), dtype=np.int64)
+        elem_buf = np.empty(max_conns, dtype=np.float64)
+        count = 0
+
+        # Build occupied sets as boolean arrays for O(1) lookup
+        occ_a_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_occ_a):
+            occ_a_set[occ_alpha[i]] = 1
+        virt_a_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_virt_a):
+            virt_a_set[virt_alpha[i]] = 1
+        occ_b_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_occ_b):
+            occ_b_set[occ_beta[i]] = 1
+        virt_b_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_virt_b):
+            virt_b_set[virt_beta[i]] = 1
+
+        n_exc = len(single_exc_pq)
+        for idx in range(n_exc):
+            p = single_exc_pq[idx, 0]
+            q = single_exc_pq[idx, 1]
+            h_pq = single_exc_hpq[idx]
+
+            # Alpha: q -> p
+            if occ_a_set[q] == 1 and virt_a_set[p] == 1:
+                val = h_pq
+                for ri in range(n_occ_a):
+                    r = occ_alpha[ri]
+                    val += J_single[p, q, r] - K_single[p, q, r]
+                for ri in range(n_occ_b):
+                    r = occ_beta[ri]
+                    val += J_single[p, q, r]
+
+                if abs(val) > 1e-12:
+                    for k in range(n_sites):
+                        conn_buf[count, k] = config[k]
+                    conn_buf[count, q] = 0
+                    conn_buf[count, p] = 1
+                    sign = numba_jw_sign_single(config, p, q)
+                    elem_buf[count] = sign * val
+                    count += 1
+
+            # Beta: q -> p
+            if occ_b_set[q] == 1 and virt_b_set[p] == 1:
+                val = h_pq
+                for ri in range(n_occ_b):
+                    r = occ_beta[ri]
+                    val += J_single[p, q, r] - K_single[p, q, r]
+                for ri in range(n_occ_a):
+                    r = occ_alpha[ri]
+                    val += J_single[p, q, r]
+
+                if abs(val) > 1e-12:
+                    p_idx = p + n_orb
+                    q_idx = q + n_orb
+                    for k in range(n_sites):
+                        conn_buf[count, k] = config[k]
+                    conn_buf[count, q_idx] = 0
+                    conn_buf[count, p_idx] = 1
+                    sign = numba_jw_sign_single(config, p_idx, q_idx)
+                    elem_buf[count] = sign * val
+                    count += 1
+
+        return conn_buf[:count], elem_buf[:count]
+
+    @njit(cache=True)
+    def _numba_double_excitations(config, n_orb, h2e):
+        """
+        Compute all double excitation connections and matrix elements.
+
+        Handles alpha-alpha, beta-beta, and alpha-beta double excitations
+        following Slater-Condon rules.
+        """
+        n_sites = len(config)
+
+        # Find occupied/virtual orbitals
+        occ_alpha = np.empty(n_orb, dtype=np.int64)
+        n_occ_a = 0
+        virt_alpha = np.empty(n_orb, dtype=np.int64)
+        n_virt_a = 0
+        for i in range(n_orb):
+            if config[i] == 1:
+                occ_alpha[n_occ_a] = i
+                n_occ_a += 1
+            else:
+                virt_alpha[n_virt_a] = i
+                n_virt_a += 1
+
+        occ_beta = np.empty(n_orb, dtype=np.int64)
+        n_occ_b = 0
+        virt_beta = np.empty(n_orb, dtype=np.int64)
+        n_virt_b = 0
+        for i in range(n_orb):
+            if config[i + n_orb] == 1:
+                occ_beta[n_occ_b] = i
+                n_occ_b += 1
+            else:
+                virt_beta[n_virt_b] = i
+                n_virt_b += 1
+
+        # Upper bound on doubles
+        n_aa = n_occ_a * (n_occ_a - 1) // 2 * n_virt_a * (n_virt_a - 1) // 2
+        n_bb = n_occ_b * (n_occ_b - 1) // 2 * n_virt_b * (n_virt_b - 1) // 2
+        n_ab = n_occ_a * n_occ_b * n_virt_a * n_virt_b
+        max_doubles = n_aa + n_bb + n_ab
+        if max_doubles == 0:
+            return np.empty((0, n_sites), dtype=np.int64), np.empty(0, dtype=np.float64)
+
+        conn_buf = np.empty((max_doubles, n_sites), dtype=np.int64)
+        elem_buf = np.empty(max_doubles, dtype=np.float64)
+        count = 0
+
+        # Alpha-Alpha doubles
+        for i in range(n_occ_a):
+            q = occ_alpha[i]
+            for j in range(i + 1, n_occ_a):
+                s = occ_alpha[j]
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(k + 1, n_virt_a):
+                        r = virt_alpha[l]
+                        val = h2e[p, q, r, s] - h2e[p, s, r, q]
+                        if abs(val) > 1e-12:
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q] = 0
+                            conn_buf[count, s] = 0
+                            conn_buf[count, p] = 1
+                            conn_buf[count, r] = 1
+                            sign = numba_jw_sign_double(config, p, r, q, s)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        # Beta-Beta doubles
+        for i in range(n_occ_b):
+            q = occ_beta[i]
+            for j in range(i + 1, n_occ_b):
+                s = occ_beta[j]
+                for k in range(n_virt_b):
+                    p = virt_beta[k]
+                    for l in range(k + 1, n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e[p, q, r, s] - h2e[p, s, r, q]
+                        if abs(val) > 1e-12:
+                            q_idx = q + n_orb
+                            s_idx = s + n_orb
+                            p_idx = p + n_orb
+                            r_idx = r + n_orb
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q_idx] = 0
+                            conn_buf[count, s_idx] = 0
+                            conn_buf[count, p_idx] = 1
+                            conn_buf[count, r_idx] = 1
+                            sign = numba_jw_sign_double(config, p_idx, r_idx, q_idx, s_idx)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        # Alpha-Beta doubles (no exchange term)
+        for i in range(n_occ_a):
+            q = occ_alpha[i]
+            for j in range(n_occ_b):
+                s = occ_beta[j]
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e[p, q, r, s]
+                        if abs(val) > 1e-12:
+                            s_idx = s + n_orb
+                            r_idx = r + n_orb
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q] = 0
+                            conn_buf[count, s_idx] = 0
+                            conn_buf[count, p] = 1
+                            conn_buf[count, r_idx] = 1
+                            sign = numba_jw_sign_double(config, p, r_idx, q, s_idx)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        return conn_buf[:count], elem_buf[:count]
+
+    def numba_get_connections(config_np, n_orb, h1e, h2e, J_single, K_single, single_exc_data):
+        """
+        Numba-accelerated get_connections.
+
+        Drop-in replacement for MolecularHamiltonian.get_connections(),
+        operating on numpy arrays directly.
+
+        Args:
+            config_np: Configuration as numpy int64 array (n_sites,)
+            n_orb: Number of spatial orbitals
+            h1e: One-electron integrals (n_orb, n_orb)
+            h2e: Two-electron integrals (n_orb, n_orb, n_orb, n_orb)
+            J_single: Precomputed Coulomb tensor J[p,q,r] = h2e[p,q,r,r]
+            K_single: Precomputed exchange tensor K[p,q,r] = h2e[p,r,r,q]
+            single_exc_data: List of (p, q, h_pq) tuples for non-zero h1e elements
+
+        Returns:
+            (connected_configs, matrix_elements) as numpy arrays
+        """
+        config_np = np.asarray(config_np, dtype=np.int64)
+
+        # Convert single_exc_data to arrays for Numba
+        n_exc = len(single_exc_data)
+        if n_exc > 0:
+            single_exc_pq = np.empty((n_exc, 2), dtype=np.int64)
+            single_exc_hpq = np.empty(n_exc, dtype=np.float64)
+            for i, (p, q, h_pq) in enumerate(single_exc_data):
+                single_exc_pq[i, 0] = p
+                single_exc_pq[i, 1] = q
+                single_exc_hpq[i] = h_pq
+        else:
+            single_exc_pq = np.empty((0, 2), dtype=np.int64)
+            single_exc_hpq = np.empty(0, dtype=np.float64)
+
+        # Single excitations — preserve original dtype (float32) to match Python path
+        s_conns, s_elems = _numba_single_excitations(
+            config_np, n_orb,
+            np.ascontiguousarray(J_single),
+            np.ascontiguousarray(K_single),
+            single_exc_pq, single_exc_hpq,
+        )
+
+        # Double excitations — preserve original dtype
+        d_conns, d_elems = _numba_double_excitations(
+            config_np, n_orb,
+            np.ascontiguousarray(h2e),
+        )
+
+        # Combine
+        if len(s_conns) == 0 and len(d_conns) == 0:
+            n_sites = len(config_np)
+            return np.empty((0, n_sites), dtype=np.int64), np.empty(0, dtype=np.float64)
+        elif len(s_conns) == 0:
+            return d_conns, d_elems
+        elif len(d_conns) == 0:
+            return s_conns, s_elems
+        else:
+            return (
+                np.concatenate((s_conns, d_conns), axis=0),
+                np.concatenate((s_elems, d_elems)),
+            )
+
+else:
+    # Fallback stubs when Numba is not available
+    def numba_jw_sign_single(config, p, q):
+        raise ImportError("numba is required for numba_jw_sign_single")
+
+    def numba_jw_sign_double(config, p, r, q, s):
+        raise ImportError("numba is required for numba_jw_sign_double")
+
+    def numba_get_connections(config_np, n_orb, h1e, h2e, J_single, K_single, single_exc_data):
+        raise ImportError("numba is required for numba_get_connections")
+
 
 @dataclass
 class MolecularIntegrals:
@@ -1224,10 +1606,7 @@ class MolecularHamiltonian(Hamiltonian):
         Batch compute off-diagonal connections for multiple configurations.
 
         Returns sparse COO format data for efficient matrix construction.
-
-        NOTE: This returns (row_indices, col_indices, values) for sparse matrix
-        construction, NOT the (connected_configs, elements, config_indices) format
-        expected by ConnectionCache.get_connections_batch interface.
+        Uses GPU-accelerated vectorized batch method for speed.
 
         Args:
             configs: (n_configs, num_sites) configurations
@@ -1238,30 +1617,40 @@ class MolecularHamiltonian(Hamiltonian):
         device = self.device
         configs = configs.to(device)
         n_configs = configs.shape[0]
-        n_orb = self.n_orbitals
+
+        # Use vectorized batch method (GPU-accelerated)
+        all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
+
+        if len(all_connected) == 0:
+            return (
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.float32, device=device),
+            )
+
+        # Integer encoding for fast lookup
+        config_ints = (configs.long() * self._powers_gpu).sum(dim=1)
+        config_ints_cpu = config_ints.cpu().tolist()
+        config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
+
+        # Encode connected configs
+        connected_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
+        connected_ints_cpu = connected_ints.cpu().tolist()
+        batch_indices_cpu = batch_indices.cpu().tolist()
 
         all_rows = []
         all_cols = []
-        all_vals = []
+        val_indices = []
 
-        # Integer encoding for fast lookup
-        powers = (2 ** torch.arange(self.num_sites, device='cpu')).flip(0)
-        configs_cpu = configs.cpu()
-        config_ints = (configs_cpu * powers).sum(dim=1).tolist()
-        config_hash = {config_ints[i]: i for i in range(n_configs)}
-
-        for j in range(n_configs):
-            connected, elements = self.get_connections(configs[j])
-            if len(connected) > 0:
-                connected_cpu = connected.cpu()
-                connected_ints = (connected_cpu * powers).sum(dim=1).tolist()
-
-                for k, conn_int in enumerate(connected_ints):
-                    if conn_int in config_hash:
-                        i = config_hash[conn_int]
-                        all_rows.append(i)
-                        all_cols.append(j)
-                        all_vals.append(elements[k].item())
+        for k in range(len(all_connected)):
+            conn_int = connected_ints_cpu[k]
+            if conn_int in config_hash:
+                i = config_hash[conn_int]
+                j = batch_indices_cpu[k]
+                if i != j:
+                    all_rows.append(i)
+                    all_cols.append(j)
+                    val_indices.append(k)
 
         if len(all_rows) == 0:
             return (
@@ -1273,7 +1662,7 @@ class MolecularHamiltonian(Hamiltonian):
         return (
             torch.tensor(all_rows, dtype=torch.long, device=device),
             torch.tensor(all_cols, dtype=torch.long, device=device),
-            torch.tensor(all_vals, dtype=torch.float32, device=device),
+            all_elements[torch.tensor(val_indices, device=device)].float(),
         )
 
     def matrix_elements(

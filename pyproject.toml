@@ -32,6 +32,7 @@ dependencies = [
     "matplotlib>=3.7.0",
     "pyscf>=2.3.0",
     "tqdm>=4.65.0",
+    "numba>=0.64.0",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +78,14 @@ line-length = 100
 target-version = "py310"
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.mypy]
 python_version = "3.10"
