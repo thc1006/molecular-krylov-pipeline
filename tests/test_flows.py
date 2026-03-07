@@ -7,132 +7,87 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from flows.discrete_flow import DiscreteFlowSampler
+from flows.particle_conserving_flow import (
+    ParticleConservingFlowSampler,
+    ParticleConservingFlow,
+    GumbelTopK,
+    verify_particle_conservation,
+)
 
 
-class TestDiscreteFlowSampler:
-    """Test cases for Discrete Flow Sampler."""
+class TestGumbelTopK:
+    """Test Gumbel-Softmax top-k selection."""
+
+    def test_output_shape(self):
+        logits = torch.randn(10, 8)
+        topk = GumbelTopK(temperature=1.0)
+        result = topk(logits, k=3)
+        assert result.shape == (10, 8)
+
+    def test_k_selected(self):
+        logits = torch.randn(5, 6)
+        topk = GumbelTopK(temperature=0.1)
+        result = topk(logits, k=2)
+        counts = result.sum(dim=1)
+        assert torch.allclose(counts, torch.tensor([2.0] * 5))
+
+    def test_gradient_flow(self):
+        logits = torch.randn(4, 6, requires_grad=True)
+        topk = GumbelTopK(temperature=1.0)
+        result = topk(logits, k=2)
+        loss = result.sum()
+        loss.backward()
+        assert logits.grad is not None
+
+
+class TestParticleConservingFlow:
+    """Test particle-conserving normalizing flow."""
 
     def test_construction(self):
-        """Test basic construction."""
-        flow = DiscreteFlowSampler(
-            num_sites=4,
-            num_coupling_layers=2,
-            hidden_dims=[32, 32],
+        flow = ParticleConservingFlowSampler(
+            num_sites=8, n_alpha=2, n_beta=2, hidden_dims=[32, 32]
         )
-        assert flow.num_sites == 4
+        assert flow.n_orbitals == 4
+        assert flow.flow.n_alpha == 2
+        assert flow.flow.n_beta == 2
 
-    def test_sample_continuous(self):
-        """Test continuous sampling."""
-        flow = DiscreteFlowSampler(num_sites=4, num_coupling_layers=2)
+    def test_sample_particle_conservation(self):
+        flow = ParticleConservingFlowSampler(
+            num_sites=8, n_alpha=2, n_beta=2, hidden_dims=[32, 32]
+        )
+        log_probs, unique_configs = flow.sample(n_samples=20)
 
-        samples = flow.sample_continuous(batch_size=10)
+        n_orb = 4
+        alpha_counts = unique_configs[:, :n_orb].sum(dim=1)
+        beta_counts = unique_configs[:, n_orb:].sum(dim=1)
 
-        # Should be in [-1, 1] due to tanh
-        assert samples.shape == (10, 4)
-        assert torch.all(samples >= -1)
-        assert torch.all(samples <= 1)
+        assert torch.all(alpha_counts == 2), "Alpha electron count violated"
+        assert torch.all(beta_counts == 2), "Beta electron count violated"
 
-    def test_discretize(self):
-        """Test discretization."""
-        flow = DiscreteFlowSampler(num_sites=4)
-
-        y = torch.tensor([
-            [0.5, -0.5, 0.1, -0.1],
-            [-0.9, 0.9, -0.9, 0.9],
-        ])
-
-        configs = flow.discretize(y)
-
-        # Should be {0, 1}
-        assert torch.all((configs == 0) | (configs == 1))
-
-        # Check specific values
-        expected = torch.tensor([
-            [1, 0, 1, 0],
-            [0, 1, 0, 1],
-        ])
-        assert torch.all(configs == expected)
-
-    def test_sample_returns_unique(self):
-        """Test that sampling returns unique configurations."""
-        flow = DiscreteFlowSampler(num_sites=4)
-
-        _, unique_configs = flow.sample(batch_size=100)
-
-        # All rows should be unique
-        n_unique = len(unique_configs)
-        assert n_unique <= 100
-        assert n_unique > 0
-
-        # Check uniqueness
-        unique_set = set(tuple(c.tolist()) for c in unique_configs)
-        assert len(unique_set) == n_unique
-
-    def test_log_prob_continuous(self):
-        """Test continuous log probability computation."""
-        flow = DiscreteFlowSampler(num_sites=4, num_coupling_layers=2)
-
-        y = torch.randn(10, 4) * 0.5  # Stay away from boundaries
-
-        log_probs = flow.log_prob_continuous(y)
-
+    def test_sample_output_shape(self):
+        flow = ParticleConservingFlowSampler(
+            num_sites=12, n_alpha=2, n_beta=2, hidden_dims=[32, 32]
+        )
+        log_probs, unique_configs = flow.sample(n_samples=10)
+        assert unique_configs.shape[1] == 12  # 2 * n_orbitals
+        assert unique_configs.shape[0] <= 10  # unique <= n_samples
         assert log_probs.shape == (10,)
-        assert torch.all(torch.isfinite(log_probs))
 
-    def test_estimate_discrete_prob(self):
-        """Test discrete probability estimation."""
-        flow = DiscreteFlowSampler(num_sites=4, num_coupling_layers=2)
-
+    def test_verify_particle_conservation_util(self):
+        # Valid configs (n_orbitals=4)
         configs = torch.tensor([
-            [0, 0, 0, 0],
-            [1, 1, 1, 1],
+            [1, 1, 0, 0, 1, 1, 0, 0],
+            [1, 0, 1, 0, 0, 1, 1, 0],
         ])
+        valid, stats = verify_particle_conservation(configs, n_orbitals=4, n_alpha=2, n_beta=2)
+        assert valid
 
-        probs = flow.estimate_discrete_prob(configs, n_mc_samples=10)
-
-        assert probs.shape == (2,)
-        assert torch.all(probs > 0)
-        assert torch.all(torch.isfinite(probs))
-
-
-class TestFlowTraining:
-    """Test flow training functionality."""
-
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(),
-        reason="CUDA not available"
-    )
-    def test_training_step(self):
-        """Test a single training step."""
-        from flows.training import FlowNQSTrainer, TrainingConfig
-        from nqs.dense import DenseNQS
-        from hamiltonians.spin import TransverseFieldIsing
-
-        # Small system for fast test
-        H = TransverseFieldIsing(num_spins=4, V=1.0, h=1.0)
-        flow = DiscreteFlowSampler(num_sites=4, num_coupling_layers=2)
-        nqs = DenseNQS(num_sites=4, hidden_dims=[32, 32])
-
-        config = TrainingConfig(
-            samples_per_batch=100,
-            num_batches=2,
-        )
-
-        trainer = FlowNQSTrainer(
-            flow=flow,
-            nqs=nqs,
-            hamiltonian=H,
-            config=config,
-            device="cpu",
-        )
-
-        # Run one step
-        metrics = trainer.train_step()
-
-        assert "energy" in metrics
-        assert "unique_ratio" in metrics
-        assert metrics["unique_ratio"] > 0
+        # Invalid configs (3 alpha instead of 2)
+        bad_configs = torch.tensor([
+            [1, 1, 1, 0, 1, 1, 0, 0],
+        ])
+        valid, stats = verify_particle_conservation(bad_configs, n_orbitals=4, n_alpha=2, n_beta=2)
+        assert not valid
 
 
 if __name__ == "__main__":

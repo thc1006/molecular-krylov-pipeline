@@ -12,12 +12,15 @@ number conservation.
 References:
 - Differentiable top-k: Cordonnier et al., "Differentiable Subset Selection"
 - Gumbel-top-k: Kool et al., "Stochastic Beams and Where to Find Them" (2019)
+- Sigmoid top-k: Thomas Ahle, "A Differentiable Top-k Layer for PyTorch" (2022)
+- Plackett-Luce: probability model for without-replacement subset selection
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from itertools import permutations as _permutations
 from typing import Tuple, Optional
 
 
@@ -67,15 +70,107 @@ class GumbelTopK(nn.Module):
         one_hot = torch.zeros_like(logits)
         one_hot.scatter_(1, top_indices, 1.0)
 
+        # Soft relaxation: full softmax over all positions (preserves gradients everywhere)
+        soft = F.softmax(perturbed_logits, dim=-1)
+
         if hard:
-            # Straight-through estimator: hard in forward, soft gradient in backward
-            soft = F.softmax(perturbed_logits, dim=-1)
-            # Create soft version by summing top-k softmax values
-            soft_topk = soft * one_hot
-            return one_hot - soft_topk.detach() + soft_topk
+            # Straight-through estimator: hard selection in forward, soft gradients in backward.
+            # Use full softmax (not masked) so gradients flow to ALL positions, enabling
+            # the network to learn to increase/decrease any orbital's probability.
+            return one_hot - soft.detach() + soft
         else:
             # Fully soft (for exploration/temperature annealing)
-            return F.softmax(perturbed_logits / self.temperature, dim=-1)
+            return soft
+
+
+class _SigmoidTopKFn(torch.autograd.Function):
+    """Custom autograd for sigmoid top-k with implicit differentiation.
+
+    Forward: binary search for threshold t such that Σσ(x_i + t) = k.
+    Backward: exact Jacobian J = diag(v) - vv^T / ||v||_1 where v = σ'(x+t).
+
+    Reference: Thomas Ahle, "A Differentiable Top-k Layer for PyTorch" (2022)
+    """
+
+    @staticmethod
+    def forward(ctx, xs, k):
+        ts = _find_threshold(xs, k)
+        ps = torch.sigmoid(xs + ts)
+        ctx.save_for_backward(xs, ts)
+        return ps
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        xs, ts = ctx.saved_tensors
+        p = torch.sigmoid(xs + ts)
+        v = p * (1 - p)  # σ'(x) = σ(x)(1-σ(x))
+        s = v.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        uv = grad_output * v
+        correction = -uv.sum(dim=-1, keepdim=True) * v / s
+        return uv + correction, None
+
+
+@torch.no_grad()
+def _find_threshold(xs: torch.Tensor, k: int) -> torch.Tensor:
+    """Binary search for threshold t such that Σσ(x_i + t) = k."""
+    lo = -xs.max(dim=-1, keepdim=True).values - 10
+    hi = -xs.min(dim=-1, keepdim=True).values + 10
+    for _ in range(48):  # 48 iterations: 2^-48 ≈ 3.6e-15 (sufficient for float64 gradcheck)
+        mid = (lo + hi) / 2
+        count = torch.sigmoid(xs + mid).sum(dim=-1, keepdim=True)
+        lo = torch.where(count < k, mid, lo)
+        hi = torch.where(count < k, hi, mid)
+    return (lo + hi) / 2
+
+
+class SigmoidTopK(nn.Module):
+    """
+    Differentiable top-k via sigmoid threshold + implicit differentiation.
+
+    Replaces GumbelTopK with a deterministic, gradient-exact alternative.
+
+    Forward: find threshold t such that Σσ(x_i/τ + t) = k, return σ(x/τ + t).
+    Backward: exact Jacobian via implicit differentiation of the constraint.
+
+    Advantages over GumbelTopK:
+    - Deterministic (no Gumbel noise)
+    - Exact marginal probabilities
+    - Better gradient quality at low temperature
+    - O(n) forward (binary search is O(n × 64 iterations))
+
+    Reference: Thomas Ahle, "A Differentiable Top-k Layer for PyTorch" (2022)
+    """
+
+    def __init__(self, temperature: float = 1.0):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        k: int,
+        hard: bool = True,
+    ) -> torch.Tensor:
+        """
+        Select k indices from logits using sigmoid threshold.
+
+        Args:
+            logits: (batch_size, n_options) unnormalized log-probabilities
+            k: number of items to select
+            hard: if True, return discrete {0,1} with STE gradients
+
+        Returns:
+            (batch_size, n_options) selection (binary if hard, [0,1] if soft)
+        """
+        scaled = logits / self.temperature
+        soft = _SigmoidTopKFn.apply(scaled, k)
+
+        if hard:
+            _, top_idx = torch.topk(soft, k, dim=-1)
+            one_hot = torch.zeros_like(logits)
+            one_hot.scatter_(1, top_idx, 1.0)
+            return one_hot - soft.detach() + soft
+        return soft
 
 
 class OrbitalScoringNetwork(nn.Module):
@@ -179,13 +274,10 @@ class ParticleConservingFlow(nn.Module):
         self.n_beta = n_beta
         self.n_qubits = 2 * n_orbitals
 
-        # Separate scoring networks for alpha and beta spins
-        self.alpha_scorer = OrbitalScoringNetwork(
-            n_orbitals, hidden_dims
-        )
-        self.beta_scorer = OrbitalScoringNetwork(
-            n_orbitals, hidden_dims
-        )
+        # Alpha spin scoring: learnable logits (no context available for alpha)
+        # Using a simple parameter instead of OrbitalScoringNetwork avoids dead weights,
+        # since alpha is always sampled first without context.
+        self.alpha_logits = nn.Parameter(torch.zeros(n_orbitals))
 
         # Alpha-beta correlation network
         # Beta scorer can see alpha configuration for correlation
@@ -229,8 +321,8 @@ class ParticleConservingFlow(nn.Module):
         """
         device = next(self.parameters()).device
 
-        # Sample alpha spin channel
-        alpha_logits = self.alpha_scorer(context=None, batch_size=batch_size)
+        # Sample alpha spin channel (learnable logits, no context)
+        alpha_logits = self.alpha_logits.unsqueeze(0).expand(batch_size, -1)
         alpha_config = self.gumbel_topk(alpha_logits, self.n_alpha, hard=hard)
 
         # Sample beta spin channel conditioned on alpha
@@ -278,21 +370,80 @@ class ParticleConservingFlow(nn.Module):
         k: int,
     ) -> torch.Tensor:
         """
-        Compute log probability of a top-k selection.
+        Compute log P(unordered set S) under Plackett-Luce model.
 
-        Approximates the combinatorial probability using softmax.
+        P(S) = Σ_{π ∈ Perm(S)} Π_{j=1}^k softmax(logit_{π(j)} | remaining)
+
+        For k ≤ 5: exact enumeration over all k! orderings via logsumexp.
+        For k > 5: single-ordering approximation (divides by k!).
         """
-        # Log-softmax for numerical stability
-        log_probs = F.log_softmax(logits, dim=-1)
+        batch_size, n = logits.shape
 
-        # Sum log probs of selected items
-        selected_log_probs = (log_probs * selection).sum(dim=-1)
+        # Get indices of selected orbitals
+        _, selected_idx = torch.topk(selection, k, dim=-1)
+        selected_idx, _ = selected_idx.sort(dim=-1)
 
-        # Normalization for k selections
-        # This is an approximation; exact would require enumerating permutations
-        log_norm = torch.lgamma(torch.tensor(k + 1.0, device=logits.device))
+        if k <= 5:
+            return self._exact_pl_log_prob(logits, selected_idx, k)
+        else:
+            return self._approx_pl_log_prob(logits, selected_idx, k)
 
-        return selected_log_probs - log_norm
+    def _exact_pl_log_prob(
+        self,
+        logits: torch.Tensor,
+        selected_idx: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Exact Plackett-Luce: sum over all k! orderings via logsumexp."""
+        all_perms = list(_permutations(range(k)))
+        log_probs_per_perm = []
+
+        for perm in all_perms:
+            perm_idx = selected_idx[:, list(perm)]
+            log_p = self._sequential_conditional(logits, perm_idx)
+            log_probs_per_perm.append(log_p)
+
+        stacked = torch.stack(log_probs_per_perm, dim=-1)
+        return torch.logsumexp(stacked, dim=-1)
+
+    def _approx_pl_log_prob(
+        self,
+        logits: torch.Tensor,
+        selected_idx: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Approximate: single ordering + multiply by k! (for k > 5)."""
+        log_p = self._sequential_conditional(logits, selected_idx)
+        # Use math.lgamma (CPU, no tensor allocation) — k is a Python int
+        import math
+        log_k_factorial = math.lgamma(k + 1.0)
+        return log_p + log_k_factorial
+
+    def _sequential_conditional(
+        self,
+        logits: torch.Tensor,
+        ordered_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute log P(s1, s2, ..., sk | ordering) via sequential conditionals.
+
+        P = Π_{j=1}^k softmax(logit_{s_j} | remaining orbitals)
+
+        At each step, previously selected orbitals are masked to -inf.
+        """
+        batch_size, n = logits.shape
+        k = ordered_idx.shape[1]
+        log_prob = torch.zeros(batch_size, device=logits.device, dtype=logits.dtype)
+        remaining = torch.ones(batch_size, n, dtype=torch.bool, device=logits.device)
+
+        for step in range(k):
+            masked_logits = logits.masked_fill(~remaining, float('-inf'))
+            log_probs_step = F.log_softmax(masked_logits, dim=-1)
+            idx = ordered_idx[:, step]
+            log_prob = log_prob + log_probs_step.gather(1, idx.unsqueeze(1)).squeeze(1)
+            remaining.scatter_(1, idx.unsqueeze(1), False)
+
+        return log_prob
 
     def log_prob(self, configs: torch.Tensor) -> torch.Tensor:
         """
@@ -311,7 +462,7 @@ class ParticleConservingFlow(nn.Module):
         beta_config = configs[:, self.n_orbitals:]
 
         # Alpha logits (unconditional)
-        alpha_logits = self.alpha_scorer(context=None, batch_size=batch_size)
+        alpha_logits = self.alpha_logits.unsqueeze(0).expand(batch_size, -1)
 
         # Beta logits (conditioned on alpha)
         alpha_context = self.alpha_to_beta(alpha_config.float())
