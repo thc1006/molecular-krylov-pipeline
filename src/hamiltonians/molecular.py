@@ -104,7 +104,7 @@ if NUMBA_AVAILABLE:
 
     @njit(cache=True)
     def _numba_single_excitations(
-        config, n_orb, h1e, h2e, J_single, K_single,
+        config, n_orb, J_single, K_single,
         single_exc_pq, single_exc_hpq,
     ):
         """
@@ -364,8 +364,6 @@ if NUMBA_AVAILABLE:
         # Single excitations — preserve original dtype (float32) to match Python path
         s_conns, s_elems = _numba_single_excitations(
             config_np, n_orb,
-            np.ascontiguousarray(h1e),
-            np.ascontiguousarray(h2e),
             np.ascontiguousarray(J_single),
             np.ascontiguousarray(K_single),
             single_exc_pq, single_exc_hpq,

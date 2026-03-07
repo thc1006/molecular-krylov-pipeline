@@ -78,7 +78,7 @@ class TestNumbaJWSign:
         from hamiltonians.molecular import numba_jw_sign_double
 
         H = lih_hamiltonian
-        hf = H.get_hf_state().numpy()
+        hf = H.get_hf_state().cpu().numpy()
         n_orb = H.n_orbitals
 
         occ_alpha = np.where(hf[:n_orb] == 1)[0]
@@ -179,7 +179,7 @@ class TestNumbaGetConnections:
         from hamiltonians.molecular import numba_get_connections
 
         H = lih_hamiltonian
-        hf = H.get_hf_state()
+        hf = H.get_hf_state().cpu()
 
         # Python reference
         py_conns, py_elems = H.get_connections(hf)
@@ -215,7 +215,7 @@ class TestNumbaGetConnections:
         from hamiltonians.molecular import numba_get_connections
 
         H = beh2_hamiltonian
-        hf = H.get_hf_state()
+        hf = H.get_hf_state().cpu()
         n_orb = H.n_orbitals
 
         # Test HF and first few single excitations
@@ -270,7 +270,7 @@ class TestNumbaSpeedup:
         from hamiltonians.molecular import numba_get_connections
 
         H = lih_hamiltonian
-        hf = H.get_hf_state()
+        hf = H.get_hf_state().cpu()
 
         # Warmup Numba JIT
         _ = numba_get_connections(
@@ -285,12 +285,13 @@ class TestNumbaSpeedup:
             H.get_connections(hf)
         t_python = time.perf_counter() - t0
 
-        # Benchmark Numba
+        # Benchmark Numba — pre-convert all arrays outside the timing loop
         hf_np = hf.numpy()
+        h1e_np = H.h1e.cpu().numpy()
         t0 = time.perf_counter()
         for _ in range(n_iter):
             numba_get_connections(
-                hf_np, H.n_orbitals, H.h1e.cpu().numpy(), H._h2e_np,
+                hf_np, H.n_orbitals, h1e_np, H._h2e_np,
                 H._J_single_np, H._K_single_np, H.single_exc_data,
             )
         t_numba = time.perf_counter() - t0
@@ -354,7 +355,7 @@ class TestNumbaEnergyAccuracy:
         from hamiltonians.molecular import numba_get_connections
 
         H = lih_hamiltonian
-        hf = H.get_hf_state()
+        hf = H.get_hf_state().cpu()
 
         # Get connections from both paths
         py_conns, py_elems = H.get_connections(hf)
