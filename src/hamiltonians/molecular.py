@@ -2032,6 +2032,7 @@ def compute_molecular_integrals(
     charge: int = 0,
     spin: int = 0,
     use_cache: bool = True,
+    cas: Optional[Tuple[int, int]] = None,
 ) -> MolecularIntegrals:
     """
     Compute molecular integrals using PySCF, with optional disk caching.
@@ -2042,6 +2043,9 @@ def compute_molecular_integrals(
         charge: Molecular charge
         spin: 2S (number of unpaired electrons)
         use_cache: If True, check/store disk cache in ~/.cache/molecular-krylov/
+        cas: Optional (nelecas, ncas) tuple for CAS active space selection.
+            When provided, runs CASSCF after RHF and returns integrals
+            in the active space only (n_orbitals = ncas).
 
     Returns:
         MolecularIntegrals object
@@ -2051,8 +2055,8 @@ def compute_molecular_integrals(
     except ImportError:
         from src.utils.hamiltonian_cache import load_integrals, save_integrals
 
-    # Try loading from cache first
-    if use_cache:
+    # Try loading from cache first (skip cache for CAS — CASSCF optimization is not cached)
+    if use_cache and cas is None:
         cached = load_integrals(geometry, basis, charge, spin)
         if cached is not None:
             print(f"[HamiltonianCache] Loaded integrals from disk cache")
@@ -2095,6 +2099,57 @@ def compute_molecular_integrals(
         mf = scf.ROHF(mol)
     mf.kernel()
 
+    # CAS active space path
+    if cas is not None:
+        from pyscf import mcscf
+
+        nelecas, ncas = cas
+        mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+        mc.kernel()
+
+        if not mc.converged:
+            import warnings
+            warnings.warn(
+                f"CASSCF did not converge for CAS({nelecas},{ncas}). "
+                "Integrals may be unreliable."
+            )
+
+        # h1e_for_cas returns (h1e_cas, e_core)
+        # e_core = nuclear_repulsion + frozen core energy
+        h1e_cas, e_core = mc.h1e_for_cas()
+
+        # Two-electron integrals in active MO basis
+        active_mo = mc.mo_coeff[:, mc.ncore:mc.ncore + mc.ncas]
+        h2e_cas = ao2mo.full(mol, active_mo)
+        h2e_cas = ao2mo.restore(1, h2e_cas, ncas)
+
+        h1e_cas = np.asarray(h1e_cas, dtype=np.float64)
+        h2e_cas = np.asarray(h2e_cas, dtype=np.float64)
+
+        # Active electron counts
+        if isinstance(nelecas, (tuple, list)):
+            n_alpha_cas = nelecas[0]
+            n_beta_cas = nelecas[1]
+            n_elec_cas = sum(nelecas)
+        else:
+            n_elec_cas = nelecas
+            n_alpha_cas = (nelecas + spin) // 2
+            n_beta_cas = (nelecas - spin) // 2
+
+        # Do NOT set _geometry/_basis/_charge/_spin metadata — CAS integrals
+        # depend on CASSCF orbital optimization which is non-deterministic,
+        # so disk caching would be unsafe.
+        return MolecularIntegrals(
+            h1e=h1e_cas,
+            h2e=h2e_cas,
+            nuclear_repulsion=float(e_core),
+            n_electrons=n_elec_cas,
+            n_orbitals=ncas,
+            n_alpha=n_alpha_cas,
+            n_beta=n_beta_cas,
+        )
+
+    # Full (non-CAS) integral computation
     # Get integrals in MO basis
     h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
 
@@ -2139,6 +2194,7 @@ def compute_molecular_integrals(
 
 def create_h2_hamiltonian(
     bond_length: float = 0.74,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create H2 Hamiltonian at given bond length."""
@@ -2146,12 +2202,13 @@ def create_h2_hamiltonian(
         ("H", (0.0, 0.0, 0.0)),
         ("H", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_lih_hamiltonian(
     bond_length: float = 1.6,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create LiH Hamiltonian at given bond length."""
@@ -2159,13 +2216,14 @@ def create_lih_hamiltonian(
         ("Li", (0.0, 0.0, 0.0)),
         ("H", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_h2o_hamiltonian(
     oh_length: float = 0.96,
     angle: float = 104.5,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create H2O Hamiltonian."""
@@ -2175,12 +2233,13 @@ def create_h2o_hamiltonian(
         ("H", (oh_length, 0.0, 0.0)),
         ("H", (oh_length * np.cos(angle_rad), oh_length * np.sin(angle_rad), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_beh2_hamiltonian(
     bond_length: float = 1.33,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -2195,13 +2254,14 @@ def create_beh2_hamiltonian(
         ("H", (0.0, 0.0, bond_length)),
         ("H", (0.0, 0.0, -bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_nh3_hamiltonian(
     nh_length: float = 1.01,
     hnh_angle: float = 107.8,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -2223,12 +2283,13 @@ def create_nh3_hamiltonian(
         ("H", (r * np.cos(np.radians(120)), r * np.sin(np.radians(120)), 0.0)),
         ("H", (r * np.cos(np.radians(240)), r * np.sin(np.radians(240)), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_n2_hamiltonian(
     bond_length: float = 1.10,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -2244,12 +2305,13 @@ def create_n2_hamiltonian(
         ("N", (0.0, 0.0, 0.0)),
         ("N", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_ch4_hamiltonian(
     ch_length: float = 1.09,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -2270,5 +2332,37 @@ def create_ch4_hamiltonian(
         ("H", (-a, a, -a)),
         ("H", (-a, -a, a)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_n2_cas_hamiltonian(
+    bond_length: float = 1.10,
+    basis: str = "cc-pvdz",
+    cas: Tuple[int, int] = (10, 8),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create N2 Hamiltonian with CAS (Complete Active Space) reduction.
+
+    Runs CASSCF to select active orbitals, then returns a Hamiltonian
+    over the CAS active space only.
+
+    Default: CAS(10, 8) on cc-pVDZ gives 8 active orbitals and
+    C(8,5)² = 3,136 configurations — small enough for exact FCI.
+
+    Args:
+        bond_length: N-N distance in Angstroms
+        basis: Basis set name (default: cc-pvdz)
+        cas: (nelecas, ncas) tuple for active space selection
+        device: Computation device
+
+    Returns:
+        MolecularHamiltonian over the CAS active space
+    """
+    geometry = [
+        ("N", (0.0, 0.0, 0.0)),
+        ("N", (0.0, 0.0, bond_length)),
+    ]
+    integrals = compute_molecular_integrals(geometry, basis=basis, cas=cas)
     return MolecularHamiltonian(integrals, device=device)

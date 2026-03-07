@@ -108,23 +108,32 @@
 
 ## Phase 3: 40Q Validation
 
+### PR 3.3a: cc-pVDZ + CAS Active Space Support ✅
+- [x] IMPL: `cas` parameter in `compute_molecular_integrals()` — CASSCF → active-space integrals
+- [x] IMPL: `basis` parameter on all 7 factory functions (backward-compatible defaults)
+- [x] IMPL: `create_n2_cas_hamiltonian()` factory (CAS(10,8) on cc-pVDZ, 3136 configs)
+- [x] IMPL: Cache bypass for CAS computations
+- [x] TEST: `test_cas_support.py` — 21 tests (basis param, CAS shapes, FCI vs CASSCF golden test)
+
+### PR 3.2: Perturbative Pruning ✅
+- [x] IMPL: `compute_mp2_amplitudes()` — t2 from stored MO integrals (no PySCF re-run)
+- [x] IMPL: `mp2_importance_scores()` — HF/singles essential, doubles by |t2|, triples by product
+- [x] IMPL: `prune_basis()` — top-K by score, preserves essential configs
+- [x] TEST: `test_perturbative_pruning.py` — 16 tests (MP2 amplitudes, scoring, pruning vs random)
+
+### PR 3.4: Benchmark Suite ✅
+- [x] IMPL: `BenchmarkTimer` (wall-clock), `MemoryTracker` (peak memory), `BenchmarkSuite` (regression detection)
+- [x] TEST: `test_benchmark.py` — 34 tests (timer, memory, suite, pipeline benchmarks)
+
 ### PR 3.1: NNCI Active Learning (research finding, 10⁵x subspace reduction)
 - [ ] TEST: `test_nnci_classifier_trains` — NN learns to predict large CI coefficients
 - [ ] TEST: `test_nnci_reduces_subspace` — fewer configs with same energy accuracy
 - [ ] IMPL: NN classifier for determinant importance scoring
 - [ ] IMPL: Active learning loop: classify → diag → retrain
 
-### PR 3.2: Perturbative Pruning (PIGen-SQD finding, 70% subspace reduction)
-- [ ] TEST: `test_mp2_importance_scoring` — MP2 amplitudes rank configs correctly
-- [ ] IMPL: MP2/CISD-level importance scoring before diagonalization
-
-### PR 3.3: N2/cc-pVDZ CAS(10,20) Integration Test
-- [ ] TEST: Full pipeline on 40Q system completes without OOM/crash
+### PR 3.3b: N2/cc-pVDZ CAS(10,20) Integration Test
+- [ ] TEST: Full pipeline on CAS(10,8) or CAS(10,20) system completes without OOM/crash
 - [ ] TEST: Energy within expected range
-
-### PR 3.4: Benchmark Suite
-- [ ] TEST: Wall-time regression tracking
-- [ ] TEST: Memory peak tracking
 
 ---
 
