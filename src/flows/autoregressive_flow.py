@@ -391,6 +391,53 @@ _STATE_ALPHA = torch.tensor([0, 0, 1, 1], dtype=torch.long)
 _STATE_BETA = torch.tensor([0, 1, 0, 1], dtype=torch.long)
 
 
+def _compute_validity_mask_vectorized(
+    alpha_rem: torch.Tensor,
+    beta_rem: torch.Tensor,
+    orbitals_after: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized validity mask for all positions at once.
+
+    Parameters
+    ----------
+    alpha_rem : torch.Tensor
+        (batch, n_orb) remaining alpha electrons at each position.
+    beta_rem : torch.Tensor
+        (batch, n_orb) remaining beta electrons at each position.
+    orbitals_after : torch.Tensor
+        (n_orb,) number of orbitals after each position.
+
+    Returns
+    -------
+    torch.Tensor
+        (batch, n_orb, 4) boolean mask.
+    """
+    # Broadcast orbitals_after: (1, n_orb) for comparison with (batch, n_orb)
+    oa = orbitals_after.unsqueeze(0)  # (1, n_orb)
+
+    batch, n_orb = alpha_rem.shape
+    device = alpha_rem.device
+
+    mask = torch.zeros(batch, n_orb, NUM_ORBITAL_STATES, dtype=torch.bool, device=device)
+
+    # State 0 (empty): alpha_rem <= oa AND beta_rem <= oa
+    mask[:, :, 0] = (alpha_rem <= oa) & (beta_rem <= oa)
+
+    # State 1 (beta): beta_rem > 0, alpha_rem <= oa, (beta_rem - 1) <= oa
+    mask[:, :, 1] = (beta_rem > 0) & (alpha_rem <= oa) & ((beta_rem - 1) <= oa)
+
+    # State 2 (alpha): alpha_rem > 0, (alpha_rem - 1) <= oa, beta_rem <= oa
+    mask[:, :, 2] = (alpha_rem > 0) & ((alpha_rem - 1) <= oa) & (beta_rem <= oa)
+
+    # State 3 (both): alpha_rem > 0, beta_rem > 0, (alpha_rem-1) <= oa, (beta_rem-1) <= oa
+    mask[:, :, 3] = (
+        (alpha_rem > 0) & (beta_rem > 0)
+        & ((alpha_rem - 1) <= oa) & ((beta_rem - 1) <= oa)
+    )
+
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Drop-in sampler
 # ---------------------------------------------------------------------------
@@ -609,41 +656,52 @@ class AutoregressiveFlowSampler(nn.Module):
         # Apply temperature
         logits = logits / self.temperature
 
-        # Compute validity masks and apply them at each position
-        alpha_rem = torch.full((batch_size,), self.n_alpha, dtype=torch.long, device=device)
-        beta_rem = torch.full((batch_size,), self.n_beta, dtype=torch.long, device=device)
+        # Vectorized validity masking: precompute electron budgets at all positions
+        # via cumulative sums (eliminates Python loop for GPU parallelism).
+        state_alpha = self._state_alpha  # (4,)
+        state_beta = self._state_beta  # (4,)
 
-        state_alpha = self._state_alpha
-        state_beta = self._state_beta
+        # Electrons consumed at each position: (batch, n_orb)
+        alpha_consumed = state_alpha[states]  # (batch, n_orb) — 0 or 1
+        beta_consumed = state_beta[states]
 
-        total_log_prob = torch.zeros(batch_size, device=device)
+        # Cumulative electrons placed *before* each position (exclusive prefix sum)
+        alpha_cum = torch.zeros(batch_size, n_orb, dtype=torch.long, device=device)
+        beta_cum = torch.zeros(batch_size, n_orb, dtype=torch.long, device=device)
+        if n_orb > 1:
+            alpha_cum[:, 1:] = torch.cumsum(alpha_consumed[:, :-1], dim=1)
+            beta_cum[:, 1:] = torch.cumsum(beta_consumed[:, :-1], dim=1)
 
-        for i in range(n_orb):
-            orbitals_after = n_orb - i - 1
-            valid_mask = compute_validity_mask(alpha_rem, beta_rem, orbitals_after)
+        # Remaining budgets at each position: (batch, n_orb)
+        alpha_rem_all = self.n_alpha - alpha_cum
+        beta_rem_all = self.n_beta - beta_cum
 
-            logits_i = logits[:, i, :]  # (batch, 4)
-            logits_i = logits_i.masked_fill(~valid_mask, float("-inf"))
+        # Compute validity masks for all positions at once: (batch, n_orb, 4)
+        orbitals_after_all = torch.arange(n_orb - 1, -1, -1, device=device)  # [n-1, n-2, ..., 0]
+        all_valid_masks = _compute_validity_mask_vectorized(
+            alpha_rem_all, beta_rem_all, orbitals_after_all
+        )
 
-            # Guard: if any sample has all states masked, the config has invalid
-            # electron count and log_softmax would produce NaN.
-            if not valid_mask.any(dim=-1).all():
-                raise ValueError(
-                    "Invalid config in log_prob: electron count mismatch. "
-                    "All 4 states masked at position {i}, likely wrong n_alpha/n_beta."
-                )
+        # Guard: check for all-masked positions (invalid electron count)
+        any_valid = all_valid_masks.any(dim=-1)  # (batch, n_orb)
+        if not any_valid.all():
+            bad_pos = (~any_valid).nonzero(as_tuple=False)
+            raise ValueError(
+                f"Invalid config in log_prob: electron count mismatch. "
+                f"All 4 states masked at {len(bad_pos)} positions, "
+                f"likely wrong n_alpha/n_beta."
+            )
 
-            log_probs_i = F.log_softmax(logits_i, dim=-1)
-            actual_state = states[:, i]  # (batch,)
-            total_log_prob = total_log_prob + log_probs_i.gather(
-                1, actual_state.unsqueeze(1)
-            ).squeeze(1)
+        # Apply masks and compute log probabilities
+        logits = logits.masked_fill(~all_valid_masks, float("-inf"))
+        log_probs_all = F.log_softmax(logits, dim=-1)  # (batch, n_orb, 4)
 
-            # Update budgets based on actual states (teacher forcing)
-            alpha_rem = alpha_rem - state_alpha[actual_state]
-            beta_rem = beta_rem - state_beta[actual_state]
+        # Gather the log prob of the actual state at each position
+        actual_lp = log_probs_all.gather(
+            2, states.unsqueeze(-1)
+        ).squeeze(-1)  # (batch, n_orb)
 
-        return total_log_prob
+        return actual_lp.sum(dim=-1)  # (batch,)
 
     # ------------------------------------------------------------------
     # Public API (matches ParticleConservingFlowSampler)
