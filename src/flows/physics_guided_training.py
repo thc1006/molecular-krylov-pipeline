@@ -1252,7 +1252,8 @@ class PhysicsGuidedFlowTrainer:
         """
         Compute energy in accumulated basis via diagonalization.
 
-        Uses sparse eigensolver for large bases (>500 configs) for efficiency.
+        Uses direct sparse construction for large bases (>3000 configs)
+        to avoid O(n²) dense matrix allocation.
         """
         if self.accumulated_basis is None or len(self.accumulated_basis) == 0:
             return float('inf')
@@ -1260,6 +1261,29 @@ class PhysicsGuidedFlowTrainer:
         n_basis = len(self.accumulated_basis)
 
         with torch.no_grad():
+            # Direct sparse path for large bases — avoids dense n×n allocation.
+            # Dense 16384² × 8 = 2.1 GB; sparse ~50 MB.
+            SPARSE_ACCUM_THRESHOLD = 3000
+            if n_basis > SPARSE_ACCUM_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+                from scipy.sparse import coo_matrix, diags
+                from scipy.sparse.linalg import eigsh
+
+                basis = self.accumulated_basis
+                rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+                rows_np = rows.cpu().numpy()
+                cols_np = cols.cpu().numpy()
+                vals_np = vals.cpu().numpy().astype(np.float64)
+
+                H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_basis, n_basis))
+                diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+                H_csr = H_coo.tocsr()
+                H_csr = 0.5 * (H_csr + H_csr.T)
+                H_csr = H_csr + diags(diag_np, 0, shape=(n_basis, n_basis), format='csr')
+
+                eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-6)
+                return float(eigenvalues[0])
+
+            # Dense path for small bases
             H_matrix = self.hamiltonian.matrix_elements(
                 self.accumulated_basis, self.accumulated_basis
             )
@@ -1268,7 +1292,7 @@ class PhysicsGuidedFlowTrainer:
             # Ensure Hermitian
             H_np = 0.5 * (H_np + H_np.T)
 
-            # Use sparse eigensolver for large matrices
+            # Use sparse eigensolver for medium matrices
             if n_basis > 500:
                 try:
                     from scipy.sparse import csr_matrix

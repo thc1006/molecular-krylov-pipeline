@@ -118,7 +118,7 @@ class TestMaxDiagBasisSizeWiring:
     def test_adapt_scales_max_diag_basis_size_very_large(self):
         config = PipelineConfig(device="cpu")
         config.adapt_to_system_size(100000, verbose=False)
-        assert config.max_diag_basis_size == 50000
+        assert config.max_diag_basis_size == 15000
 
     def test_adapt_scales_max_diag_basis_size_large(self):
         config = PipelineConfig(device="cpu")

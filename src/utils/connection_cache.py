@@ -144,6 +144,7 @@ class ConnectionCache:
         if key in self._cache:
             self.hits += 1
             self._recent_hits += 1
+            self._recent_total += 1
             self._total_accesses += 1
             self._access_count[key] = self._total_accesses
             return self._cache[key]
@@ -205,8 +206,12 @@ class ConnectionCache:
         return connected, elements
 
     def should_bypass(self) -> bool:
-        """Check if cache should be bypassed due to low hit rate."""
-        self._recent_total += 1
+        """Check if cache should be bypassed due to low hit rate.
+
+        NOTE: Do NOT increment _recent_total here — it is already incremented
+        in get() on cache miss (line 152) and _recent_hits on cache hit (line 146).
+        Double-counting would inflate the denominator and trigger premature bypass.
+        """
         if self._recent_total >= self._bypass_check_interval:
             recent_hit_rate = self._recent_hits / self._recent_total
             # Reset counters

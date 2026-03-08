@@ -1069,27 +1069,13 @@ class MolecularHamiltonian(Hamiltonian):
         """
         Compute Jordan-Wigner sign for a+_p a_q (numpy version).
 
-        Sign = (-1)^(number of occupied sites between p and q)
-
-        OPTIMIZED: Uses bitwise operations when config is convertible to int.
-        For 28-qubit C2H4: ~10x faster than array slicing.
+        Sign = (-1)^(number of occupied sites between p and q).
+        Uses numpy vectorized slice sum — faster than Python for-loop
+        for all gap sizes due to C-level array operations.
         """
         if p == q:
             return 1
         low, high = min(p, q), max(p, q)
-
-        # Fast path: use bitwise operations for counting
-        # This is much faster than array slicing for large systems
-        if high - low > 3:  # Only beneficial for larger gaps
-            # Create mask for bits between low and high (exclusive)
-            # mask = ((1 << (high - low - 1)) - 1) << (len(config) - high)
-            # But we need to work with the config as bits
-            count = 0
-            for i in range(low + 1, high):
-                count += config[i]
-            return 1 if (count & 1) == 0 else -1
-
-        # Original path for small gaps
         count = config[low + 1:high].sum()
         return 1 if (count & 1) == 0 else -1
 
@@ -1588,6 +1574,18 @@ class MolecularHamiltonian(Hamiltonian):
         configs = configs.to(self.device)
         n_configs = configs.shape[0]
 
+        # SIZE GUARD: refuse to allocate dense matrices that would cause OOM.
+        # n² × 8 bytes (float64): 20000² = 3.2 GB, 50000² = 20 GB, 63504² = 32 GB.
+        # On DGX Spark 128GB UMA, 20000 is a safe upper bound for dense allocation.
+        MAX_DENSE_CONFIGS = 20000
+        if n_configs > MAX_DENSE_CONFIGS:
+            mem_gb = n_configs ** 2 * 8 / 1e9
+            raise MemoryError(
+                f"matrix_elements_fast() refused to build {n_configs}×{n_configs} dense matrix "
+                f"({mem_gb:.1f} GB). Use get_sparse_matrix_elements() + diagonal_elements_batch() "
+                f"for systems with >{MAX_DENSE_CONFIGS} configs."
+            )
+
         H = torch.zeros(n_configs, n_configs, device=self.device, dtype=self.h1e.dtype)
 
         # Vectorized diagonal (already GPU-accelerated)
@@ -2064,30 +2062,60 @@ class MolecularHamiltonian(Hamiltonian):
         # Stack configs into tensor
         basis_tensor = torch.stack(basis_configs).to(self.device)
 
-        # Use the SAME matrix construction as pipeline for consistency
-        H_fci = self.matrix_elements(basis_tensor, basis_tensor)
+        # Memory-safe path selection:
+        # Dense n×n matrix = n² × 8 bytes (float64).
+        # Threshold 5000: 5000² × 8 = 200 MB (safe).
+        # Above that: use direct sparse construction → O(nnz) ≈ O(200n) memory.
+        SPARSE_FCI_THRESHOLD = 5000
 
-        # Convert to numpy with float64 for numerical stability
-        H_np = H_fci.cpu().numpy().astype(np.float64)
+        if n_configs > SPARSE_FCI_THRESHOLD:
+            # Sparse path: build CSR directly from get_sparse_matrix_elements()
+            # For CAS(10,10) 63504 configs: ~150 MB instead of ~97 GB
+            from scipy.sparse import coo_matrix, diags
+            from scipy.sparse.linalg import eigsh
 
-        # Ensure Hermitian symmetry (critical for correct eigenvalues)
-        H_np = 0.5 * (H_np + H_np.T)
+            print(f"  Using direct sparse construction ({n_configs} > {SPARSE_FCI_THRESHOLD})")
+            mem_dense_gb = n_configs ** 2 * 8 / 1e9
+            mem_sparse_est_mb = n_configs * 200 * 12 / 1e6  # ~200 nnz/row, 12 bytes each
+            print(f"  Memory: sparse ~{mem_sparse_est_mb:.0f} MB vs dense ~{mem_dense_gb:.1f} GB")
 
-        # Verify Hermiticity
-        asymmetry = np.abs(H_np - H_np.T).max()
-        if asymmetry > 1e-10:
-            print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
+            rows, cols, vals = self.get_sparse_matrix_elements(basis_tensor)
+            rows_np = rows.cpu().numpy()
+            cols_np = cols.cpu().numpy()
+            vals_np = vals.cpu().numpy().astype(np.float64)
 
-        # Diagonalize using numpy for small matrices, sparse for large
-        if n_configs <= 2000:
-            eigenvalues, _ = np.linalg.eigh(H_np)
+            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_configs, n_configs))
+            diag_np = self.diagonal_elements_batch(basis_tensor).cpu().numpy().astype(np.float64)
+            H_csr = H_coo.tocsr()
+            H_csr = 0.5 * (H_csr + H_csr.T)
+            H_csr = H_csr + diags(diag_np, 0, shape=(n_configs, n_configs), format='csr')
+
+            eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-12)
             fci_E = float(eigenvalues[0])
         else:
-            from scipy.sparse import csr_matrix
-            from scipy.sparse.linalg import eigsh
-            H_sparse = csr_matrix(H_np)
-            eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
-            fci_E = float(eigenvalues[0])
+            # Dense path for small systems — exact and fast
+            H_fci = self.matrix_elements(basis_tensor, basis_tensor)
+
+            # Convert to numpy with float64 for numerical stability
+            H_np = H_fci.cpu().numpy().astype(np.float64)
+
+            # Ensure Hermitian symmetry (critical for correct eigenvalues)
+            H_np = 0.5 * (H_np + H_np.T)
+
+            # Verify Hermiticity
+            asymmetry = np.abs(H_np - H_np.T).max()
+            if asymmetry > 1e-10:
+                print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
+
+            if n_configs <= 2000:
+                eigenvalues, _ = np.linalg.eigh(H_np)
+                fci_E = float(eigenvalues[0])
+            else:
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.linalg import eigsh
+                H_sparse = csr_matrix(H_np)
+                eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
+                fci_E = float(eigenvalues[0])
 
         elapsed = time.time() - start_time
         print(f"FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")

@@ -288,7 +288,10 @@ class PipelineConfig:
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
-            self.max_diag_basis_size = 50000
+            # Keep aligned with MAX_FULL_SUBSPACE_SIZE (15000) to ensure
+            # even dense fallback paths stay within memory budget.
+            # 15000² × 16 (complex128) = 3.6 GB — safe on DGX Spark 128GB UMA.
+            self.max_diag_basis_size = 15000
 
             # Network capacity
             self.nqs_hidden_dims = [512, 512, 512, 512]
@@ -886,15 +889,18 @@ class FlowGuidedKrylovPipeline:
                            self.results.get("skqd_energy",
                            self.results.get("sqd_energy",
                            self.results.get("nf_nqs_energy"))))
-            error_ha = abs(best_energy - self.exact_energy)
-            error_mha = error_ha * 1000
-            error_kcal = error_ha * 627.5
-            print(f"\nError: {error_mha:.4f} mHa ({error_kcal:.4f} kcal/mol)")
-
-            if error_kcal < 1.0:
-                print("Chemical accuracy: PASS")
+            if best_energy is None:
+                print("\nError: N/A (energy not computed)")
             else:
-                print("Chemical accuracy: FAIL")
+                error_ha = abs(best_energy - self.exact_energy)
+                error_mha = error_ha * 1000
+                error_kcal = error_ha * 627.5
+                print(f"\nError: {error_mha:.4f} mHa ({error_kcal:.4f} kcal/mol)")
+
+                if error_kcal < 1.0:
+                    print("Chemical accuracy: PASS")
+                else:
+                    print("Chemical accuracy: FAIL")
 
         print("=" * 60)
 

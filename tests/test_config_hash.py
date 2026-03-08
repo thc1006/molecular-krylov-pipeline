@@ -35,12 +35,15 @@ class TestConfigIntegerHash:
         """Multiple configs with n_sites=4 produce distinct hashes."""
         from utils.config_hash import config_integer_hash
 
-        configs = torch.tensor([
-            [1, 0, 1, 0],  # 10
-            [0, 1, 0, 1],  # 5
-            [1, 1, 0, 0],  # 12
-            [0, 0, 1, 1],  # 3
-        ], dtype=torch.float32)
+        configs = torch.tensor(
+            [
+                [1, 0, 1, 0],  # 10
+                [0, 1, 0, 1],  # 5
+                [1, 1, 0, 0],  # 12
+                [0, 0, 1, 1],  # 3
+            ],
+            dtype=torch.float32,
+        )
         hashes = config_integer_hash(configs)
         assert hashes == [10, 5, 12, 3]
 
@@ -49,12 +52,15 @@ class TestConfigIntegerHash:
         from utils.config_hash import config_integer_hash
 
         # All 2-bit configs
-        configs = torch.tensor([
-            [0, 0],
-            [0, 1],
-            [1, 0],
-            [1, 1],
-        ], dtype=torch.float32)
+        configs = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 0],
+                [1, 1],
+            ],
+            dtype=torch.float32,
+        )
         hashes = config_integer_hash(configs)
         assert len(set(hashes)) == 4, "4 distinct configs should give 4 distinct hashes"
 
@@ -96,7 +102,7 @@ class TestConfigIntegerHash:
 
         n_sites = 64
         configs = torch.zeros(2, n_sites, dtype=torch.float32)
-        configs[0, 0] = 1.0   # Only MSB set
+        configs[0, 0] = 1.0  # Only MSB set
         configs[1, -1] = 1.0  # Only LSB set
 
         hashes = config_integer_hash(configs)
@@ -112,19 +118,22 @@ class TestConfigIntegerHash:
         configs = (torch.rand(200, n_sites) > 0.5).float()
         unique_configs = torch.unique(configs, dim=0)
         hashes = config_integer_hash(unique_configs)
-        assert len(set(hashes)) == len(unique_configs), (
-            f"Expected {len(unique_configs)} unique hashes, got {len(set(hashes))}"
-        )
+        assert len(set(hashes)) == len(
+            unique_configs
+        ), f"Expected {len(unique_configs)} unique hashes, got {len(set(hashes))}"
 
     def test_boundary_64_all_zeros_and_ones(self):
         """All-zeros and all-ones at n_sites=64 produce different hashes."""
         from utils.config_hash import config_integer_hash
 
         n_sites = 64
-        configs = torch.tensor([
-            [0] * n_sites,
-            [1] * n_sites,
-        ], dtype=torch.float32)
+        configs = torch.tensor(
+            [
+                [0] * n_sites,
+                [1] * n_sites,
+            ],
+            dtype=torch.float32,
+        )
         hashes = config_integer_hash(configs)
         assert hashes[0] != hashes[1]
 
@@ -139,9 +148,9 @@ class TestConfigIntegerHash:
         configs = (torch.rand(500, n_sites) > 0.5).float()
         unique_configs = torch.unique(configs, dim=0)
         hashes = config_integer_hash(unique_configs)
-        assert len(set(hashes)) == len(unique_configs), (
-            f"Expected {len(unique_configs)} unique hashes, got {len(set(hashes))}"
-        )
+        assert len(set(hashes)) == len(
+            unique_configs
+        ), f"Expected {len(unique_configs)} unique hashes, got {len(set(hashes))}"
 
     def test_large_system_no_int64_overflow(self):
         """Confirm no int64 overflow occurs for n_sites=80."""
@@ -154,9 +163,9 @@ class TestConfigIntegerHash:
         hashes = config_integer_hash(configs)
         assert len(hashes) == 1
         # The hash should be a tuple (split hash), not a plain int
-        assert isinstance(hashes[0], tuple), (
-            f"For n_sites >= 64, hash should be a tuple, got {type(hashes[0])}"
-        )
+        assert isinstance(
+            hashes[0], tuple
+        ), f"For n_sites >= 64, hash should be a tuple, got {type(hashes[0])}"
 
     def test_large_system_100_qubits(self):
         """n_sites=100 (50 orbitals) — stress test for very large systems."""

@@ -22,15 +22,14 @@ Usage::
 """
 
 import torch
-from typing import List, Union
 
 # Type alias for the hash return type
-ConfigHash = Union[int, tuple]
+ConfigHash = int | tuple
 
 
 def config_integer_hash(
     configs: torch.Tensor,
-) -> List[ConfigHash]:
+) -> list[ConfigHash]:
     """Hash binary configuration vectors to integers, handling n_sites >= 64 overflow.
 
     For n_sites < 64, each config is encoded as a single int64:
@@ -61,7 +60,7 @@ def config_integer_hash(
     device = configs.device
 
     if n_sites < 64:
-        # Standard path: single int64 encoding — backward-compatible
+        # Standard path: single int64 encoding -- backward-compatible
         powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
         return (configs.long() * powers).sum(dim=1).cpu().tolist()
     else:
@@ -76,4 +75,4 @@ def config_integer_hash(
         hash_hi = (configs[:, :half].long() * powers_hi).sum(dim=1)
         hash_lo = (configs[:, half:].long() * powers_lo).sum(dim=1)
 
-        return list(zip(hash_hi.cpu().tolist(), hash_lo.cpu().tolist()))
+        return list(zip(hash_hi.cpu().tolist(), hash_lo.cpu().tolist(), strict=True))

@@ -667,7 +667,7 @@ class SampleBasedKrylovDiagonalization:
         max_multinomial_categories = 2**24
         if n_subspace <= max_multinomial_categories and torch.cuda.is_available():
             # Use CUDA for sampling (faster)
-            probs_torch = torch.from_numpy(probs).float().cuda()
+            probs_torch = torch.from_numpy(probs).double().cuda()
             indices = torch.multinomial(
                 probs_torch, num_samples, replacement=True
             ).cpu().numpy()
@@ -998,7 +998,18 @@ class SampleBasedKrylovDiagonalization:
             E0 = float(eigenvalues[0].cpu())
             v0 = eigenvectors[:, 0] if return_eigenvector else None
         except Exception as e:
-            print(f"  Sparse eigsh failed ({e}), falling back to dense")
+            # For large bases, do NOT fall back to dense — it would cause OOM.
+            # The SPARSE_THRESHOLD (3000) that routes here means n >= 3000.
+            # Dense fallback is only acceptable for bases that accidentally
+            # ended up here but are still small enough for dense.
+            SAFE_DENSE_LIMIT = 5000
+            if n > SAFE_DENSE_LIMIT:
+                raise RuntimeError(
+                    f"Sparse eigsh failed for {n} configs ({e}). "
+                    f"Dense fallback refused (would allocate {n**2 * 8 / 1e9:.1f} GB). "
+                    f"Fix the sparse eigensolver or reduce basis size."
+                ) from e
+            print(f"  Sparse eigsh failed ({e}), falling back to dense (n={n} <= {SAFE_DENSE_LIMIT})")
             H_proj = self.hamiltonian.matrix_elements(basis, basis)
             H_np = H_proj.cpu().numpy().astype(np.float64)
             H_np = 0.5 * (H_np + H_np.T)
@@ -1032,6 +1043,12 @@ class SampleBasedKrylovDiagonalization:
         """
         if max_krylov_dim is None:
             max_krylov_dim = self.config.max_krylov_dim
+
+        if max_krylov_dim < 2:
+            raise ValueError(
+                f"max_krylov_dim must be >= 2, got {max_krylov_dim}. "
+                f"The Krylov loop requires at least 2 dimensions to produce results."
+            )
 
         # Generate Krylov samples
         self.generate_krylov_samples(max_krylov_dim, progress=progress)
@@ -1437,7 +1454,15 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
             return H_csr
         except Exception as e:
-            print(f"  Sparse Krylov H build failed ({e}), falling back to dense")
+            # For large bases, do NOT fall back to dense — it would cause OOM.
+            # Dense fallback is only safe for small bases (< KRYLOV_SPARSE_THRESHOLD).
+            if n >= self.KRYLOV_SPARSE_THRESHOLD:
+                raise RuntimeError(
+                    f"Sparse Krylov H build failed for {n} configs ({e}). "
+                    f"Dense fallback refused (would allocate {n**2 * 16 / 1e9:.1f} GB). "
+                    f"Fix the sparse path instead."
+                ) from e
+            print(f"  Sparse Krylov H build failed ({e}), falling back to dense (n={n} < {self.KRYLOV_SPARSE_THRESHOLD})")
             H = self.hamiltonian.matrix_elements(basis, basis)
             H = H.to(torch.complex128)
             H = 0.5 * (H + H.conj().T)
