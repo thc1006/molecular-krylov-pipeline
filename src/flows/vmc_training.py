@@ -265,22 +265,38 @@ class VMCTrainer:
             weighted = all_elements_real * amplitude_ratios
 
             if sign_x is not None:
-                # Compute sign ratios s(y)/s(x) WITH gradient tracking
-                sign_y = self.sign_network(all_connected_flow)  # (total_conn,) WITH grad
+                # Compute sign ratios s(y)/s(x) WITH gradient tracking.
+                # Batch the sign network to avoid OOM for large connection counts.
+                batch_size = self.config.log_prob_batch_size
+                n_conn = all_connected_flow.shape[0]
+                if batch_size <= 0 or n_conn <= batch_size:
+                    sign_y = self.sign_network(all_connected_flow)
+                else:
+                    sign_parts = []
+                    for start in range(0, n_conn, batch_size):
+                        end = min(start + batch_size, n_conn)
+                        sign_parts.append(self.sign_network(all_connected_flow[start:end]))
+                    sign_y = torch.cat(sign_parts, dim=0)
+
                 sign_x_expanded = sign_x[all_orig_idx_t]  # (total_conn,) WITH grad
 
-                # Sign ratio: s(y) / s(x).  Add small eps to avoid division by zero
-                # when s(x) is very close to 0 (early in training).
-                sign_ratio = sign_y / (sign_x_expanded + 1e-8 * sign_x_expanded.sign())
+                # Safe sign ratio: s(y) / s(x).  Guard against s(x)=0
+                # (tanh(0)=0, sign(0)=0, so `eps*sign(x)` fails at exactly 0).
+                # Use directional eps: positive when s(x)>=0, negative otherwise.
+                eps = 1e-8
+                safe_denom = sign_x_expanded + eps * (
+                    2.0 * (sign_x_expanded >= 0).float() - 1.0
+                )
+                sign_ratio = sign_y / safe_denom
 
-                # Convert weighted to float for multiplication with sign_ratio
-                weighted_f = weighted.float().to(flow_device)
-                sign_weighted = weighted_f * sign_ratio.float()
+                # Keep FP64 precision: promote sign_ratio to double for
+                # multiplication with weighted (float64 Hamiltonian elements).
+                sign_ratio_f64 = sign_ratio.double()
+                sign_weighted = weighted.to(flow_device) * sign_ratio_f64
 
-                # Scatter-add the sign-weighted contributions
-                # Use float tensor for grad tracking, then convert back
+                # Scatter-add in FP64 for precision
                 sign_off_diag = torch.zeros(
-                    n_samples, dtype=torch.float32, device=flow_device
+                    n_samples, dtype=torch.float64, device=flow_device
                 )
                 sign_off_diag.scatter_add_(
                     0, all_orig_idx_t.to(flow_device), sign_weighted
@@ -290,8 +306,8 @@ class VMCTrainer:
                 off_diag.scatter_add_(0, all_orig_idx_t, weighted)
 
         if sign_off_diag is not None:
-            # Return with gradient through sign network
-            local_energies = diag.float().to(sign_off_diag.device) + sign_off_diag
+            # Return in FP64 with gradient through sign network
+            local_energies = diag.double().to(sign_off_diag.device) + sign_off_diag
             if local_energies.is_complex():
                 local_energies = local_energies.real
             return local_energies

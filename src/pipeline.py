@@ -504,6 +504,8 @@ class FlowGuidedKrylovPipeline:
             self.sign_network = SignNetwork(num_sites=self.num_sites).to(self.device)
             print(f"Sign network initialized ({sum(p.numel() for p in self.sign_network.parameters())} params)")
         else:
+            if cfg.use_sign_network and not cfg.use_vmc_training:
+                print("WARNING: use_sign_network=True requires use_vmc_training=True. Sign network not created.")
             self.sign_network = None
 
         # Neural Quantum State
