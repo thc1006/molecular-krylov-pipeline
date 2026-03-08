@@ -45,9 +45,10 @@ class ConnectionCache:
         self.bypass_threshold = bypass_threshold
 
         # Powers of 2 for integer encoding - precomputed on GPU.
-        # For num_sites < 64, use int64 powers (exact).
-        # For num_sites >= 64, use split encoding via config_integer_hash.
-        self._use_split_hash = num_sites >= 64
+        # For num_sites <= 52, float64 matmul is exact (53-bit mantissa).
+        # For num_sites >= 53, use split encoding via config_integer_hash
+        # to avoid hash collisions from float64 precision loss.
+        self._use_split_hash = num_sites >= 53
         if not self._use_split_hash:
             # Float64 powers for CUDA matmul compatibility (CUDA doesn't
             # support matmul for int64). Safe for num_sites <= 52 (53-bit mantissa).
@@ -295,9 +296,10 @@ class ConnectionCache:
                     all_elements.append(batch_elements)
                     all_indices.append(remapped_indices)
 
-                # Cache individual results
+                # Cache individual results (O(n) lookup via reverse map)
+                idx_to_local = {idx: local for local, idx in enumerate(configs_to_compute)}
                 for idx, key in configs_to_compute_indices:
-                    mask = batch_indices_long == configs_to_compute.index(idx)
+                    mask = batch_indices_long == idx_to_local[idx]
                     if mask.sum() > 0:
                         self._cache[key] = (
                             batch_connected[mask],

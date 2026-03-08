@@ -836,12 +836,14 @@ class SampleBasedKrylovDiagonalization:
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
-                return self._svd_ground_state(H, return_eigenvector)
+                E0, v0 = self._svd_ground_state(H, return_eigenvector)
+                return E0 - energy_shift, v0
         except (RuntimeError, ValueError) as e:
             if "out of memory" in str(e).lower():
                 raise
             print(f"WARNING: Could not compute condition number ({e}), using SVD")
-            return self._svd_ground_state(H, return_eigenvector)
+            E0, v0 = self._svd_ground_state(H, return_eigenvector)
+            return E0 - energy_shift, v0
 
         # GPU-accelerated eigensolver — stays entirely on GPU
         # gpu_eigsh uses dense torch.linalg.eigh for n <= 10000, CuPy sparse for larger
@@ -1032,6 +1034,8 @@ class SampleBasedKrylovDiagonalization:
                 H_np += regularization * np.eye(n)
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
+            if regularization > 0:
+                E0 -= regularization
             v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
 
         if return_eigenvector:
@@ -1362,10 +1366,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         # Prefer exploring connections of high-amplitude basis states
         if hasattr(self, '_nf_guided_psi') and self._nf_guided_psi is not None:
             psi = self._nf_guided_psi
-            probs = np.abs(psi[:len(basis)]) ** 2
+            n_psi = len(psi)
+            n_basis = len(basis)
+            if n_psi < n_basis:
+                # Basis grew since psi was computed — pad with small uniform weight
+                probs = np.zeros(n_basis)
+                probs[:n_psi] = np.abs(psi) ** 2
+                probs[n_psi:] = 1e-10
+            else:
+                probs = np.abs(psi[:n_basis]) ** 2
             probs = probs / probs.sum()
             indices_np = np.random.choice(
-                len(basis), size=n_sample, replace=False, p=probs
+                n_basis, size=n_sample, replace=False, p=probs
             )
             indices = torch.from_numpy(indices_np)
         else:

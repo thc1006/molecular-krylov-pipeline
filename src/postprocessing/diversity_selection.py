@@ -493,9 +493,22 @@ class DiversitySelector:
             3: int(max_configs * cfg.rank_3_fraction),
         }
 
-        # Remaining goes to rank 4+
+        # Remaining goes to rank 4+ (shared across all ranks >= 4)
         used = sum(budgets.values())
-        budgets[4] = max_configs - used
+        rank4_plus_budget = max_configs - used
+
+        # Distribute rank 4+ budget across all ranks >= 4 present in buckets
+        high_ranks = sorted(r for r in self.bucketer.buckets.keys() if r >= 4)
+        if high_ranks:
+            high_rank_counts = {r: len(self.bucketer.get_bucket(r)) for r in high_ranks}
+            total_high = sum(high_rank_counts.values())
+            if total_high > 0:
+                for r in high_ranks:
+                    budgets[r] = max(1, int(rank4_plus_budget * high_rank_counts[r] / total_high))
+            else:
+                budgets[4] = rank4_plus_budget
+        else:
+            budgets[4] = rank4_plus_budget
 
         return budgets
 
