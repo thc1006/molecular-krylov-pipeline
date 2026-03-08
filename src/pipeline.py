@@ -65,21 +65,11 @@ try:
     from .postprocessing.diversity_selection import (
         DiversitySelector,
         DiversityConfig,
-        select_diverse_basis,
-    )
-    from .postprocessing.eigensolver import (
-        davidson_eigensolver,
-        adaptive_eigensolver,
     )
 except ImportError:
     from postprocessing.diversity_selection import (
         DiversitySelector,
         DiversityConfig,
-        select_diverse_basis,
-    )
-    from postprocessing.eigensolver import (
-        davidson_eigensolver,
-        adaptive_eigensolver,
     )
 
 # Krylov / subspace diagonalization components
@@ -157,14 +147,19 @@ class PipelineConfig:
     skqd_regularization: float = 1e-8  # Regularization for numerical stability
     max_diag_basis_size: int = 15000  # Max basis for diag (matches SKQDConfig default)
     skip_skqd: bool = False  # Skip Krylov refinement (for NF-only mode comparison)
+    skqd_convergence_threshold: float = 1e-5  # Energy convergence threshold (Ha)
+    skqd_adaptive_dt: bool = False  # Adaptive dt based on spectral range
+
+    # NNCI parameters (Neural Network Configuration Interaction)
+    # NNCI uses a feedforward NN to classify important higher-excitation configs
+    # (triples, quadruples) beyond CISD, expanding the basis via active learning.
+    # None = auto (adapt_to_system_size decides based on system size)
+    use_nnci: Optional[bool] = None
+    nnci_iterations: int = 5  # Active learning iterations
+    nnci_candidates_per_iter: int = 5000  # Max candidates to generate per iteration
 
     # Training mode
     use_local_energy: bool = True  # Use VMC local energy (proper variational estimator)
-    use_ci_seeding: bool = False  # Seed with CI basis (set True if NF struggles)
-
-    # Eigensolver
-    use_davidson: bool = True
-    davidson_threshold: int = 500  # Use Davidson for bases larger than this
 
     # Direct-CI mode: skip NF-NQS training entirely
     # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
@@ -181,6 +176,13 @@ class PipelineConfig:
             self._user_set_skip_nf = True
         else:
             self.skip_nf_training = False  # Resolve None to default False
+
+        # Track if user explicitly set use_nnci (True or False)
+        # so adapt_to_system_size() won't override their choice.
+        if self.use_nnci is not None:
+            self._user_set_nnci = True
+        else:
+            self.use_nnci = False  # Resolve None to default False
 
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
     # These dramatically reduce training time for large molecules (>20 qubits)
@@ -232,6 +234,15 @@ class PipelineConfig:
             else:
                 self.skip_nf_training = False
 
+        # Conditional NNCI based on system size (PR-B1)
+        # Systems > 20K configs: NNCI discovers important triples/quadruples via NN classifier
+        # User explicit override (_user_set_nnci) is always preserved
+        if not hasattr(self, "_user_set_nnci"):
+            if n_valid_configs > 20000:
+                self.use_nnci = True
+            else:
+                self.use_nnci = False
+
         if verbose:
             print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
             if self.skip_nf_training:
@@ -278,6 +289,8 @@ class PipelineConfig:
             # More training
             self.max_epochs = max(self.max_epochs, 600)
             self.samples_per_batch = 4000
+            # Enable adaptive dt for large systems (prevents aliasing)
+            self.skqd_adaptive_dt = True
             # SQD: more batches
             if self.subspace_mode == "sqd":
                 self.sqd_num_batches = max(self.sqd_num_batches, 10)
@@ -309,6 +322,8 @@ class PipelineConfig:
 
             # Reduce Krylov dimension for large systems
             self.max_krylov_dim = 4
+            # Enable adaptive dt for very large systems (prevents aliasing)
+            self.skqd_adaptive_dt = True
 
             # SQD: more batches for large systems
             if self.subspace_mode == "sqd":
@@ -734,6 +749,51 @@ class FlowGuidedKrylovPipeline:
             print("SKQD disabled, computing direct diagonalization...")
             return self._direct_diagonalize(nf_basis)
 
+        # NNCI expansion: expand basis with NN-guided active learning (PR-B1)
+        # before Krylov refinement. NNCI discovers important triples/quadruples
+        # beyond the CISD basis, improving the starting point for SKQD.
+        if cfg.use_nnci:
+            print("Running NNCI basis expansion...")
+            try:
+                try:
+                    from .krylov.nnci import NNCIConfig, NNCIActiveLearning
+                except ImportError:
+                    from krylov.nnci import NNCIConfig, NNCIActiveLearning
+
+                nnci_config = NNCIConfig(
+                    max_iterations=cfg.nnci_iterations,
+                    top_k=min(50, cfg.nnci_candidates_per_iter),
+                    max_candidates=cfg.nnci_candidates_per_iter,
+                    max_excitation_rank=4,
+                    training_epochs=100,
+                    convergence_threshold=1e-6,
+                    max_basis_size=min(cfg.max_diag_basis_size, 15000),
+                )
+
+                nnci = NNCIActiveLearning(
+                    hamiltonian=self.hamiltonian,
+                    initial_basis=nf_basis,
+                    config=nnci_config,
+                )
+                nnci_results = nnci.run()
+
+                expanded_basis = nnci_results["final_basis"]
+                n_added = len(expanded_basis) - len(nf_basis)
+                print(
+                    f"NNCI added {n_added} configs "
+                    f"(basis: {len(nf_basis)} -> {len(expanded_basis)})"
+                )
+                nf_basis = expanded_basis
+                self.results["nnci_configs_added"] = n_added
+                self.results["nnci_energy"] = nnci_results["energy"]
+            except (RuntimeError, MemoryError, ValueError, ImportError) as e:
+                import traceback
+                print(f"NNCI expansion failed: {e}")
+                traceback.print_exc()
+                self.results["nnci_configs_added"] = 0
+        else:
+            self.results["nnci_configs_added"] = 0
+
         # Configure SKQD
         skqd_config = SKQDConfig(
             max_krylov_dim=cfg.max_krylov_dim,
@@ -742,6 +802,8 @@ class FlowGuidedKrylovPipeline:
             use_gpu=(self.device == "cuda"),
             regularization=getattr(cfg, 'skqd_regularization', 1e-8),
             max_diag_basis_size=cfg.max_diag_basis_size,
+            convergence_threshold=getattr(cfg, 'skqd_convergence_threshold', 1e-5),
+            adaptive_dt=getattr(cfg, 'skqd_adaptive_dt', False),
         )
 
         skqd = FlowGuidedSKQD(

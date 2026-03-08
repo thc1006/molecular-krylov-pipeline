@@ -394,6 +394,9 @@ def _expm_multiply_lanczos(
     if not v.is_complex():
         v = v.to(torch.complex128)
 
+    # Clamp krylov_dim to matrix size (Krylov subspace is at most n-dimensional)
+    krylov_dim = min(krylov_dim, n)
+
     # Normalize input vector
     beta = torch.linalg.norm(v)
     if beta < tol:
@@ -416,10 +419,18 @@ def _expm_multiply_lanczos(
         # Compute diagonal element
         alpha[j] = torch.vdot(V[:, j], w).real
 
-        # Orthogonalize against previous vectors
+        # Orthogonalize against previous vectors (3-term recurrence)
         if j > 0:
             w = w - beta_vec[j] * V[:, j - 1]
         w = w - alpha[j] * V[:, j]
+
+        # Full reorthogonalization against ALL previous Lanczos vectors.
+        # In finite-precision arithmetic, the 3-term recurrence loses
+        # orthogonality (Paige 1980). This is O(j*n) per step but critical
+        # for numerical correctness when krylov_dim > ~10.
+        for i in range(j + 1):
+            proj = torch.vdot(V[:, i], w)
+            w = w - proj * V[:, i]
 
         # Compute off-diagonal element
         beta_new = torch.linalg.norm(w).real

@@ -30,17 +30,18 @@ are FCI, computed at runtime via `MolecularHamiltonian.fci_energy()`.
 src/
 ├── pipeline.py                        # Orchestrator: PipelineConfig + FlowGuidedKrylovPipeline
 ├── flows/
-│   ├── particle_conserving_flow.py    # ParticleConservingFlowSampler (GumbelTopK)
+│   ├── particle_conserving_flow.py    # ParticleConservingFlowSampler (SigmoidTopK + Plackett-Luce)
 │   └── physics_guided_training.py     # PhysicsGuidedFlowTrainer co-trains NF + NQS
 ├── nqs/
 │   ├── base.py                        # NeuralQuantumState ABC
 │   └── dense.py                       # DenseNQS (real-valued log-amplitude network)
 ├── hamiltonians/
 │   ├── base.py                        # Hamiltonian ABC (diagonal_element, get_connections)
-│   └── molecular.py                   # MolecularHamiltonian (PySCF, Slater-Condon rules)
+│   └── molecular.py                   # MolecularHamiltonian (PySCF, Slater-Condon, Numba JIT)
 ├── krylov/
 │   ├── skqd.py                        # SampleBasedKrylovDiagonalization + FlowGuidedSKQD
 │   ├── sqd.py                         # SQDSolver (IBM paper algorithm)
+│   ├── nnci.py                        # NNCIActiveLearning (NN classifier + active learning)
 │   └── basis_sampler.py               # CUDA-Q classical Krylov sampling (optional)
 ├── postprocessing/
 │   ├── diversity_selection.py         # DiversitySelector (DPP-greedy, excitation-rank buckets)
@@ -49,7 +50,12 @@ src/
 │   └── utils.py                       # Hamming distance, excitation rank utilities
 └── utils/
     ├── gpu_linalg.py                  # gpu_eigh, gpu_eigsh, gpu_expm_multiply
-    └── connection_cache.py            # LRU cache for Hamiltonian connections (GPU keys)
+    ├── connection_cache.py            # LRU cache for Hamiltonian connections (GPU keys)
+    ├── config_hash.py                 # Overflow-safe config integer hashing (n_sites >= 64)
+    ├── hamiltonian_cache.py           # Disk cache for integrals (h1e/h2e) and FCI energy
+    ├── memory_logger.py               # Pre-allocation memory logging (/proc/meminfo)
+    ├── benchmark.py                   # BenchmarkTimer, MemoryTracker, regression detection
+    └── perturbative_pruning.py        # MP2 importance scoring and basis pruning
 ```
 
 ---
@@ -184,12 +190,12 @@ skip_skqd: bool = False                  # True = NF-only mode (no Krylov)
 
 # Training mode
 use_local_energy: bool = True
-use_ci_seeding: bool = False
-skip_nf_training: bool = False            # True = Direct-CI mode
+skip_nf_training: Optional[bool] = None   # None=auto, True=Direct-CI, False=NF
 
-# Eigensolver
-use_davidson: bool = True
-davidson_threshold: int = 500
+# NNCI parameters
+use_nnci: Optional[bool] = None           # None=auto, True=enable, False=disable
+nnci_iterations: int = 5
+nnci_candidates_per_iter: int = 5000
 
 # Hardware
 device: str = "cuda" if available else "cpu"
@@ -206,7 +212,8 @@ stochastic_connections_fraction: float = 1.0
 - large (5K-20K): NQS [512]*5, basis 12K, 600 epochs
 - very_large (>20K): NQS [512]*4, basis 16K, Krylov dim 4
 
-Always forces `skip_nf_training=True` (Direct-CI).
+Conditional NF: >20K configs enables NF (`skip_nf_training=False`), ≤20K skips.
+`_user_set_skip_nf` preserves explicit user overrides. NNCI auto-enables for >20K.
 
 ### 4.2 MolecularHamiltonian (src/hamiltonians/molecular.py)
 
@@ -253,9 +260,10 @@ log_probs, configs = flow.sample(batch_size=1000)
 # log_probs: (1000,) log-probabilities
 ```
 
-Uses **GumbelTopK** (Gumbel-Softmax straight-through estimator) for
-differentiable top-k orbital selection. The flow learns per-orbital logits,
-then selects exactly k occupied orbitals via the Gumbel trick.
+Uses **SigmoidTopK** with **Plackett-Luce** probability model for
+differentiable top-k orbital selection. Learnable temperature (nn.Parameter
+with softplus reparameterization, min_temperature=0.1). The flow learns
+per-orbital logits, then selects exactly k occupied orbitals.
 
 ### 4.4 PhysicsGuidedFlowTrainer (src/flows/physics_guided_training.py)
 
@@ -526,10 +534,10 @@ To add a third subspace diagonalization method:
 
 ## 13. Known Limitations and Open Issues
 
-1. **`adapt_to_system_size` always forces `skip_nf_training=True`.**
-   To actually run NF training, you must set `skip_nf_training=False`
-   AFTER calling `adapt_to_system_size`, or pass `auto_adapt=False` to
-   the pipeline constructor.
+1. **`adapt_to_system_size` conditionally enables NF for >20K configs.**
+   For ≤20K configs, NF is skipped (Direct-CI). Explicit user overrides
+   via `skip_nf_training=True/False` are preserved (`_user_set_skip_nf`).
+   NNCI is also auto-enabled for >20K configs unless user overrides.
 
 2. **No `create_c2h4_hamiltonian` factory.** C2H4 (28 qubits, 9M configs)
    requires manual PySCF construction. The very_large tier code paths exist

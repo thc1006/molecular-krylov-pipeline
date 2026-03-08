@@ -86,6 +86,18 @@ class SKQDConfig:
     # are used for diagonalization. Set to 0 to disable (no cap).
     max_diag_basis_size: int = 15000
 
+    # === ADAPTIVE CONVERGENCE (PR-A2) ===
+    # Energy convergence threshold (Hartree). If |E_k - E_{k-1}| < threshold,
+    # early-stop the Krylov expansion. Set to 0 to disable early stopping.
+    # Recommended: 1e-5 (0.01 mHa) when enabling convergence-based early stop.
+    convergence_threshold: float = 1e-5
+
+    # Adaptive time step scaling. When True, dt is clamped to pi/spectral_range
+    # to prevent aliasing when the Hamiltonian has wide eigenvalue spread.
+    # Default False to preserve backward compatibility. Enable for large systems
+    # (40Q+) where spectral range can cause aliasing with fixed dt.
+    adaptive_dt: bool = False
+
 
 class SampleBasedKrylovDiagonalization:
     """
@@ -836,6 +848,7 @@ class SampleBasedKrylovDiagonalization:
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
+                self._last_ill_conditioned = True
                 E0, v0 = self._svd_ground_state(H, return_eigenvector)
                 return E0 - energy_shift, v0
         except (RuntimeError, ValueError) as e:
@@ -1164,6 +1177,59 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             super().__init__(hamiltonian, config, initial_state)
 
         self.nf_basis = nf_basis  # (n_nf, num_sites)
+
+    def _nnci_expand_basis(
+        self,
+        basis: torch.Tensor,
+        nnci_iterations: int = 5,
+        nnci_candidates_per_iter: int = 5000,
+    ) -> torch.Tensor:
+        """
+        Expand basis using NNCI (Neural Network Configuration Interaction).
+
+        Trains a feedforward NN classifier on CI coefficients to discover
+        important higher-excitation configurations (triples, quadruples, etc.)
+        beyond the initial CISD basis.
+
+        Args:
+            basis: Initial basis tensor (n_configs, n_sites)
+            nnci_iterations: Number of active learning iterations
+            nnci_candidates_per_iter: Max candidates to generate per iteration
+
+        Returns:
+            Expanded basis tensor with NNCI-discovered configs appended
+        """
+        try:
+            from ..krylov.nnci import NNCIConfig, NNCIActiveLearning
+        except ImportError:
+            from krylov.nnci import NNCIConfig, NNCIActiveLearning
+
+        nnci_config = NNCIConfig(
+            max_iterations=nnci_iterations,
+            top_k=min(50, nnci_candidates_per_iter),
+            max_candidates=nnci_candidates_per_iter,
+            max_excitation_rank=4,
+            training_epochs=100,
+            convergence_threshold=1e-6,
+        )
+
+        print(f"NNCI expansion: {nnci_iterations} iterations, "
+              f"up to {nnci_candidates_per_iter} candidates/iter")
+
+        nnci = NNCIActiveLearning(
+            hamiltonian=self.hamiltonian,
+            initial_basis=basis,
+            config=nnci_config,
+        )
+
+        results = nnci.run()
+
+        expanded_basis = results["final_basis"]
+        n_added = len(expanded_basis) - len(basis)
+        print(f"NNCI added {n_added} configs "
+              f"(basis: {len(basis)} -> {len(expanded_basis)})")
+
+        return expanded_basis
 
     def get_combined_basis(
         self,
@@ -1632,6 +1698,46 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         return results
 
+    def _compute_adaptive_dt(self, basis: torch.Tensor) -> float:
+        """
+        Compute safe time step based on spectral range of diagonal elements.
+
+        The Nyquist-like condition dt <= pi / spectral_range prevents aliasing
+        when the Hamiltonian has wide eigenvalue spread. If adaptive_dt is
+        disabled in config, returns the configured time_step unchanged.
+
+        Args:
+            basis: Basis configurations to estimate spectral range from.
+
+        Returns:
+            Effective dt (may be smaller than config.time_step).
+        """
+        if not self.config.adaptive_dt:
+            return self.config.time_step
+
+        # Estimate spectral range from diagonal elements
+        if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
+            diag = self.hamiltonian.diagonal_elements_batch(basis)
+            diag_np = diag.cpu().numpy().astype(np.float64)
+        else:
+            diag_np = np.array([
+                self.hamiltonian.diagonal_element(c).item() for c in basis
+            ], dtype=np.float64)
+
+        spectral_range = float(diag_np.max() - diag_np.min())
+
+        if spectral_range <= 0:
+            return self.config.time_step
+
+        dt_safe = np.pi / spectral_range
+        effective_dt = min(self.config.time_step, dt_safe)
+
+        if effective_dt < self.config.time_step:
+            print(f"Adaptive dt: {self.config.time_step:.4f} -> {effective_dt:.6f} "
+                  f"(spectral_range={spectral_range:.4f})")
+
+        return effective_dt
+
     def run_with_nf(
         self,
         max_krylov_dim: Optional[int] = None,
@@ -1657,10 +1763,17 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         - Uses float64 for better numerical precision
 
         Returns:
-            Dictionary with results comparing NF-only, Krylov-only, and combined
+            Dictionary with results comparing NF-only, Krylov-only, and combined.
+            Includes energy_history, effective_dt, converged, ill_conditioned_stop.
         """
         if max_krylov_dim is None:
             max_krylov_dim = self.config.max_krylov_dim
+
+        # === PR-A2: Adaptive dt scaling ===
+        effective_dt = self._compute_adaptive_dt(self.nf_basis)
+        # Temporarily override time_step for Krylov generation
+        original_dt = self.time_step
+        self.time_step = effective_dt
 
         # Energy with NF basis only (reference for stability check)
         E_nf, _ = self.compute_ground_state_energy(
@@ -1675,6 +1788,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         else:
             self.generate_krylov_samples(max_krylov_dim, progress=progress)
 
+        # Restore original dt
+        self.time_step = original_dt
+
         results = {
             "krylov_dims": [],
             "energies_krylov": [],
@@ -1684,11 +1800,17 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             "energy_nf_only": E_nf,
             "nf_basis_size": len(self.nf_basis),
             "numerical_warnings": [],
+            # PR-A2 additions
+            "energy_history": [],
+            "effective_dt": effective_dt,
+            "converged": False,
+            "ill_conditioned_stop": False,
         }
 
         best_energy = E_nf
         best_basis_size = len(self.nf_basis)
         instability_detected = False
+        convergence_threshold = self.config.convergence_threshold
 
         # For large systems (>10k configs), skip per-dimension diagnostics
         # and only compute final energy to avoid expensive matrix builds
@@ -1712,6 +1834,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             results["energies_combined"].append(E_combined)
             results["basis_sizes_krylov"].append(len(krylov_basis))
             results["basis_sizes_combined"].append(len(combined_basis))
+            results["energy_history"].append(E_combined)
 
             best_energy = E_combined
             best_basis_size = len(combined_basis)
@@ -1723,12 +1846,37 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
                 # Combined: NF basis + Krylov-discovered configs
                 combined_basis = self.get_combined_basis(k, include_nf=True)
+
+                # === PR-A2: Conditioning guard ===
+                # Reset flag before eigensolve. compute_ground_state_energy()
+                # sets _last_ill_conditioned=True when cond(H) > 1e12.
+                self._last_ill_conditioned = False
+
                 E_combined, _ = self.compute_ground_state_energy(
                     combined_basis,
                     regularization=self.config.regularization
                 )
                 # Use combined energy as krylov estimate too (avoids second eigsh call)
                 E_krylov = E_combined
+
+                # Check if compute_ground_state_energy detected ill-conditioning
+                if getattr(self, '_last_ill_conditioned', False):
+                    print(f"WARNING: Ill-conditioned H at k={k+1}. "
+                          f"Stopping Krylov expansion early.")
+                    results["ill_conditioned_stop"] = True
+                    results["energy_history"].append(E_combined)
+                    if E_combined < best_energy:
+                        best_energy = E_combined
+                        best_basis_size = len(combined_basis)
+                    results["krylov_dims"].append(k + 1)
+                    results["energies_krylov"].append(E_krylov)
+                    results["energies_combined"].append(E_combined)
+                    results["basis_sizes_krylov"].append(len(krylov_basis))
+                    results["basis_sizes_combined"].append(len(combined_basis))
+                    break
+
+                # Record energy in history
+                results["energy_history"].append(E_combined)
 
                 # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
                 # If energy increases, likely numerical instability
@@ -1738,14 +1886,20 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
                     # Energy should not increase significantly
                     if energy_change > 0.001:  # 1 mHa tolerance
-                        warning = f"k={k+1}: Energy increased by {energy_change*1000:.4f} mHa (numerical instability)"
+                        warning = (
+                            f"k={k+1}: Energy increased by "
+                            f"{energy_change*1000:.4f} mHa (numerical instability)"
+                        )
                         results["numerical_warnings"].append(warning)
                         print(f"WARNING: {warning}")
                         instability_detected = True
 
                     # Large energy jumps can indicate numerical instability
-                    if abs(energy_change) > 1.0:  # 1 Ha is suspicious for Krylov refinement
-                        warning = f"k={k+1}: Large energy jump {abs(energy_change):.4f} Ha"
+                    if abs(energy_change) > 1.0:  # 1 Ha is suspicious
+                        warning = (
+                            f"k={k+1}: Large energy jump "
+                            f"{abs(energy_change):.4f} Ha"
+                        )
                         results["numerical_warnings"].append(warning)
                         print(f"WARNING: {warning}")
                         instability_detected = True
@@ -1760,6 +1914,34 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 results["energies_combined"].append(E_combined)
                 results["basis_sizes_krylov"].append(len(krylov_basis))
                 results["basis_sizes_combined"].append(len(combined_basis))
+
+                # === PR-A2: Energy convergence early stopping ===
+                _CONVERGENCE_WINDOW = 3
+                initial_basis_size = results["nf_basis_size"]
+                basis_has_grown = any(
+                    s > initial_basis_size
+                    for s in results["basis_sizes_combined"]
+                )
+                hist = results["energy_history"]
+                if (
+                    convergence_threshold > 0
+                    and len(hist) >= _CONVERGENCE_WINDOW + 1
+                    and basis_has_grown
+                ):
+                    window_converged = True
+                    for wi in range(1, _CONVERGENCE_WINDOW + 1):
+                        if abs(hist[-wi] - hist[-wi - 1]) >= convergence_threshold:
+                            window_converged = False
+                            break
+                    if window_converged:
+                        delta_E = abs(hist[-1] - hist[-2])
+                        print(
+                            f"Energy converged at k={k+1}: "
+                            f"|dE|={delta_E:.2e} < {convergence_threshold:.2e} "
+                            f"(stable for {_CONVERGENCE_WINDOW} steps)"
+                        )
+                        results["converged"] = True
+                        break
 
         # Report statistics on Krylov contribution
         if results["energies_combined"]:
