@@ -445,11 +445,14 @@ class DiversitySelector:
 
             # Select diverse subset from bucket
             if self.config.use_dpp_selection and n_bucket > n_select:
-                selected = self._dpp_select(
+                # _dpp_select returns LOCAL indices into bucket_tensor (0..n_bucket-1)
+                local_selected = self._dpp_select(
                     bucket_tensor, bucket_weights, n_select
                 )
+                # Map local → global indices into unique_configs
+                selected = bucket_indices[local_selected]
             else:
-                # Simple weighted selection
+                # _weighted_select already returns global indices
                 selected = self._weighted_select(
                     bucket_indices, bucket_weights, min(n_select, n_bucket)
                 )

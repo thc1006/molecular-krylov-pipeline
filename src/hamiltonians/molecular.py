@@ -1586,6 +1586,18 @@ class MolecularHamiltonian(Hamiltonian):
                 f"for systems with >{MAX_DENSE_CONFIGS} configs."
             )
 
+        # Memory logging before dense allocation
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+        dtype_str = "complex128" if self.h1e.is_complex() else "float64"
+        if log_allocation:
+            log_allocation("matrix_elements_fast", n_configs, dtype=dtype_str, layout="dense")
+
         H = torch.zeros(n_configs, n_configs, device=self.device, dtype=self.h1e.dtype)
 
         # Vectorized diagonal (already GPU-accelerated)
@@ -1985,8 +1997,8 @@ class MolecularHamiltonian(Hamiltonian):
                 eigenvalues, eigenvectors = eigsh(H_sparse, k=1, which="SA")
                 psi0 = eigenvectors[:, 0]
                 return fci_energy_val, torch.from_numpy(psi0).to(device)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"WARNING: ground_state eigenvector computation failed: {e}")
 
         # For larger systems, return None for eigenvector
         return fci_energy_val, None
@@ -2058,6 +2070,17 @@ class MolecularHamiltonian(Hamiltonian):
         n_configs = len(basis_configs)
         print(f"Computing FCI energy in {n_configs} configuration subspace...")
         start_time = time.time()
+
+        # Memory logging
+        try:
+            from utils.memory_logger import log_allocation, log_system_memory
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation, log_system_memory
+            except ImportError:
+                log_allocation = log_system_memory = None
+        if log_allocation:
+            log_system_memory("fci_energy start")
 
         # Stack configs into tensor
         basis_tensor = torch.stack(basis_configs).to(self.device)

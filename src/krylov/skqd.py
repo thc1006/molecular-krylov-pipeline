@@ -784,14 +784,27 @@ class SampleBasedKrylovDiagonalization:
         n = len(basis)
         device = basis.device
 
+        # Memory logging
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         # Use sparse path for large bases to avoid O(n²) dense matrix
         SPARSE_THRESHOLD = 3000
         if n >= SPARSE_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+            if log_allocation:
+                log_allocation("compute_ground_state_energy", n, layout="sparse")
             return self._sparse_ground_state(
                 basis, return_eigenvector, regularization, shift_invert=shift_invert
             )
 
         # Dense path: build projected Hamiltonian
+        if log_allocation:
+            log_allocation("compute_ground_state_energy", n, dtype="float64", layout="dense")
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
 
         # Use float64 for numerical stability (GPU supports double precision)
@@ -824,8 +837,10 @@ class SampleBasedKrylovDiagonalization:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
                 return self._svd_ground_state(H, return_eigenvector)
-        except Exception:
-            print("WARNING: Could not compute condition number, using SVD")
+        except (RuntimeError, ValueError) as e:
+            if "out of memory" in str(e).lower():
+                raise
+            print(f"WARNING: Could not compute condition number ({e}), using SVD")
             return self._svd_ground_state(H, return_eigenvector)
 
         # GPU-accelerated eigensolver — stays entirely on GPU
@@ -1430,14 +1445,26 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         """
         n = len(basis)
 
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from ..utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         if n < self.KRYLOV_SPARSE_THRESHOLD:
             # Dense path — fast for small systems
+            if log_allocation:
+                log_allocation("_build_hamiltonian_in_basis_gpu", n, dtype="complex128", layout="dense")
             H = self.hamiltonian.matrix_elements(basis, basis)
             H = H.to(torch.complex128)
             H = 0.5 * (H + H.conj().T)
             return H
 
         # Sparse path — returns scipy CSR directly (no torch conversion)
+        if log_allocation:
+            log_allocation("_build_hamiltonian_in_basis_gpu", n, dtype="float64", layout="sparse")
         try:
             from scipy.sparse import coo_matrix, diags
 

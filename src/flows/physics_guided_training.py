@@ -823,9 +823,7 @@ class PhysicsGuidedFlowTrainer:
             eigenvalues = torch.linalg.eigvalsh(H_sub)
             E_ground = eigenvalues[0]
 
-        # Return as tensor that can flow through gradient computation
-        # (even though we detach it, keeping consistent tensor type helps)
-        return E_ground.float()
+        return E_ground
 
     def _compute_local_energies(
         self,
@@ -894,7 +892,7 @@ class PhysicsGuidedFlowTrainer:
             log_psi_orig = nqs_forward(configs.float()).clone()
 
             # Step 6: Evaluate NQS on ALL connected configs in large chunks
-            log_psi_connected = torch.empty(total_connections, device=self.device)
+            log_psi_connected = torch.empty(total_connections, device=self.device, dtype=torch.float64)
 
             for start in range(0, total_connections, nqs_chunk_size):
                 end = min(start + nqs_chunk_size, total_connections)
@@ -1260,11 +1258,21 @@ class PhysicsGuidedFlowTrainer:
 
         n_basis = len(self.accumulated_basis)
 
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from ..utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         with torch.no_grad():
             # Direct sparse path for large bases — avoids dense n×n allocation.
             # Dense 16384² × 8 = 2.1 GB; sparse ~50 MB.
             SPARSE_ACCUM_THRESHOLD = 3000
             if n_basis > SPARSE_ACCUM_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+                if log_allocation:
+                    log_allocation("_compute_accumulated_energy", n_basis, dtype="float64", layout="sparse")
                 from scipy.sparse import coo_matrix, diags
                 from scipy.sparse.linalg import eigsh
 
@@ -1284,6 +1292,8 @@ class PhysicsGuidedFlowTrainer:
                 return float(eigenvalues[0])
 
             # Dense path for small bases
+            if log_allocation:
+                log_allocation("_compute_accumulated_energy", n_basis, dtype="float64", layout="dense")
             H_matrix = self.hamiltonian.matrix_elements(
                 self.accumulated_basis, self.accumulated_basis
             )
@@ -1300,8 +1310,8 @@ class PhysicsGuidedFlowTrainer:
                     H_sparse = csr_matrix(H_np)
                     eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-6)
                     return float(eigenvalues[0])
-                except Exception:
-                    pass  # Fall back to dense
+                except Exception as e:
+                    print(f"WARNING: sparse eigsh failed in _compute_accumulated_energy ({e}), falling back to dense")
 
             # Dense diagonalization for small matrices
             eigenvalues, _ = np.linalg.eigh(H_np)

@@ -618,7 +618,7 @@ class FlowGuidedKrylovPipeline:
         history = self.trainer.train()
 
         self.results["training_history"] = history
-        self.results["nf_nqs_energy"] = history["energies"][-1]
+        self.results["nf_nqs_energy"] = history["energies"][-1] if history.get("energies") else None
 
         return history
 
@@ -813,7 +813,17 @@ class FlowGuidedKrylovPipeline:
 
     def _direct_diagonalize(self, basis: torch.Tensor) -> Dict[str, Any]:
         """Compute energy by direct diagonalization of basis."""
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         print("Computing energy via direct diagonalization...")
+        if log_allocation:
+            log_allocation("_direct_diagonalize", len(basis), dtype="float64", layout="dense")
         H_matrix = self.hamiltonian.matrix_elements(basis, basis)
         H_np = H_matrix.detach().cpu().numpy()
         H_np = 0.5 * (H_np + H_np.T)
