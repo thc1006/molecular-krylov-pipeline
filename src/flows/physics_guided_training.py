@@ -781,7 +781,10 @@ class PhysicsGuidedFlowTrainer:
 
                     # Identify which configs are NOT in essential set using integer encoding
                     # Overflow-safe: handles n_sites >= 64
-                    from utils.config_hash import config_integer_hash
+                    try:
+                        from ..utils.config_hash import config_integer_hash
+                    except ImportError:
+                        from utils.config_hash import config_integer_hash
 
                     all_ints = config_integer_hash(configs)
                     ess_ints = config_integer_hash(self._essential_configs)
@@ -1084,10 +1087,13 @@ class PhysicsGuidedFlowTrainer:
         """
         config = self.config
 
-        # Get flow probabilities
-        flow_probs = self.flow.estimate_discrete_prob(unique_configs)
-        flow_probs = flow_probs / (flow_probs.sum() + 1e-10)
-        log_flow_probs = torch.log(flow_probs + 1e-10)
+        # Get flow log-probabilities directly (avoids exp→log round-trip precision loss).
+        # The old path: estimate_discrete_prob → log(exp(lp) + eps) would underflow
+        # for log_prob < -87 (float32), returning -23.03 instead of the true value.
+        log_flow_probs_raw = self.flow.log_prob(unique_configs)
+        log_Z = torch.logsumexp(log_flow_probs_raw, dim=0)
+        log_flow_probs = log_flow_probs_raw - log_Z
+        flow_probs = torch.exp(log_flow_probs)
 
         # === Teacher Loss ===
         # KL(NQS || Flow) = sum p_nqs * (log p_nqs - log p_flow)
@@ -1186,7 +1192,10 @@ class PhysicsGuidedFlowTrainer:
 
         # Use overflow-safe integer hash for fast deduplication
         # Handles n_sites >= 64 (40+ orbitals) without int64 overflow
-        from utils.config_hash import config_integer_hash
+        try:
+            from ..utils.config_hash import config_integer_hash
+        except ImportError:
+            from utils.config_hash import config_integer_hash
 
         if self.accumulated_basis is None:
             # First batch: just deduplicate new_configs

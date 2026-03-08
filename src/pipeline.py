@@ -32,6 +32,7 @@ try:
         ParticleConservingFlowSampler,
         verify_particle_conservation,
     )
+    from .flows.autoregressive_flow import AutoregressiveFlowSampler
     from .flows.physics_guided_training import (
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
@@ -41,6 +42,7 @@ except ImportError:
         ParticleConservingFlowSampler,
         verify_particle_conservation,
     )
+    from flows.autoregressive_flow import AutoregressiveFlowSampler
     from flows.physics_guided_training import (
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
@@ -99,6 +101,10 @@ class PipelineConfig:
 
     # Flow type
     use_particle_conserving_flow: bool = True  # Use particle-conserving flow for molecules
+    # Autoregressive transformer flow (Phase 4a): captures inter-orbital correlations.
+    # When True, uses AutoregressiveFlowSampler instead of ParticleConservingFlowSampler.
+    # None = auto (adapt_to_system_size decides: >20K configs -> autoregressive)
+    use_autoregressive_flow: Optional[bool] = None
 
     # NF-NQS architecture
     nf_hidden_dims: list = field(default_factory=lambda: [256, 256])
@@ -184,6 +190,13 @@ class PipelineConfig:
         else:
             self.use_nnci = False  # Resolve None to default False
 
+        # Track if user explicitly set use_autoregressive_flow (True or False)
+        # so adapt_to_system_size() won't override their choice.
+        if self.use_autoregressive_flow is not None:
+            self._user_set_autoregressive_flow = True
+        else:
+            self.use_autoregressive_flow = False  # Resolve None to default False
+
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
     # These dramatically reduce training time for large molecules (>20 qubits)
 
@@ -242,6 +255,16 @@ class PipelineConfig:
                 self.use_nnci = True
             else:
                 self.use_nnci = False
+
+        # Conditional autoregressive flow based on system size (Phase 4a)
+        # Systems > 20K configs: autoregressive transformer captures inter-orbital
+        # correlations that the non-autoregressive product-of-marginals model cannot.
+        # User explicit override (_user_set_autoregressive_flow) is always preserved.
+        if not hasattr(self, "_user_set_autoregressive_flow"):
+            if n_valid_configs > 20000:
+                self.use_autoregressive_flow = True
+            else:
+                self.use_autoregressive_flow = False
 
         if verbose:
             print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
@@ -428,18 +451,31 @@ class FlowGuidedKrylovPipeline:
         """Initialize flow, NQS, and auxiliary components."""
         cfg = self.config
 
-        # Initialize particle-conserving flow for molecules
+        # Initialize flow sampler for molecules
         n_alpha = self.hamiltonian.n_alpha
         n_beta = self.hamiltonian.n_beta
 
-        self.flow = ParticleConservingFlowSampler(
-            num_sites=self.num_sites,
-            n_alpha=n_alpha,
-            n_beta=n_beta,
-            hidden_dims=cfg.nf_hidden_dims,
-        ).to(self.device)
-
-        print(f"Using particle-conserving flow: {n_alpha}α + {n_beta}β electrons")
+        if cfg.use_autoregressive_flow:
+            self.flow = AutoregressiveFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+            ).to(self.device)
+            print(
+                f"Using autoregressive transformer flow: "
+                f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons"
+            )
+        else:
+            self.flow = ParticleConservingFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+                hidden_dims=cfg.nf_hidden_dims,
+            ).to(self.device)
+            print(
+                f"Using particle-conserving flow: "
+                f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons"
+            )
 
         # Neural Quantum State
         self.nqs = DenseNQS(
