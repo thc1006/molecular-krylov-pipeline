@@ -135,13 +135,20 @@ class VMCTrainer:
         hamiltonian: Any,
         config: VMCConfig | None = None,
         device: str = "cpu",
+        sign_network: nn.Module | None = None,
     ):
         self.flow = flow
         self.hamiltonian = hamiltonian
         self.config = config or VMCConfig()
         self.device = device
+        self.sign_network = sign_network
 
-        self.optimizer = torch.optim.Adam(flow.parameters(), lr=self.config.lr)
+        # Collect all trainable parameters (flow + sign network)
+        params = list(flow.parameters())
+        if sign_network is not None:
+            params += list(sign_network.parameters())
+
+        self.optimizer = torch.optim.Adam(params, lr=self.config.lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizer, gamma=self.config.lr_decay
         )
@@ -154,7 +161,14 @@ class VMCTrainer:
     ) -> torch.Tensor:
         """Compute local energy E_loc(x) for each sampled configuration.
 
-        E_loc(x) = H_{xx} + sum_{y connected} H_{xy} * exp(0.5 * (log p(y) - log p(x)))
+        Without sign network (positive-real ansatz):
+            E_loc(x) = H_{xx} + sum_{y connected} H_{xy} * exp(0.5 * (log p(y) - log p(x)))
+
+        With sign network (signed ansatz):
+            E_loc(x) = H_{xx} + sum_{y connected} H_{xy} * exp(0.5 * (log p(y) - log p(x))) * s(y)/s(x)
+
+        When a sign network is present, the returned tensor carries gradients
+        through the sign network for direct backpropagation of ∇_φ <H>.
 
         Parameters
         ----------
@@ -179,9 +193,18 @@ class VMCTrainer:
         # --- Diagonal contributions: H_{xx} ---
         diag = self.hamiltonian.diagonal_elements_batch(configs_h)  # (n_samples,) float64
 
+        # --- Sign values for sampled configs ---
+        if self.sign_network is not None:
+            flow_device = next(self.flow.parameters()).device
+            sign_x = self.sign_network(configs.float().to(flow_device))  # (n_samples,) WITH grad
+        else:
+            sign_x = None
+
         # --- Off-diagonal contributions ---
         # For each config x, get connected configs y and matrix elements H_{xy}
         off_diag = torch.zeros(n_samples, dtype=torch.float64, device=h_device)
+        # Track sign contribution separately so we can backprop through it
+        sign_off_diag = None
 
         # Collect all connections serially (vectorized batch requires GPU tensors)
         all_connected = []
@@ -228,36 +251,73 @@ class VMCTrainer:
             # log_probs of original configs at each connection's source index
             log_probs_orig = log_probs.to(h_device).double()[all_orig_idx_t]
 
-            # Amplitude ratio: psi(y)/psi(x) = sqrt(p(y)/p(x))
-            #                                = exp(0.5 * (log p(y) - log p(x)))
+            # Amplitude ratio: |psi(y)|/|psi(x)| = sqrt(p(y)/p(x))
+            #                                    = exp(0.5 * (log p(y) - log p(x)))
             log_ratio = 0.5 * (log_probs_connected - log_probs_orig)
             # Clamp for numerical stability (avoid exp overflow)
             log_ratio = torch.clamp(log_ratio, min=-30.0, max=30.0)
             amplitude_ratios = torch.exp(log_ratio)
 
-            # Weighted off-diagonal contributions
+            # Weighted off-diagonal contributions (no sign)
             all_elements_real = all_elements_t.double()
             if all_elements_real.is_complex():
                 all_elements_real = all_elements_real.real
             weighted = all_elements_real * amplitude_ratios
 
-            # Scatter-add to source config indices
-            off_diag.scatter_add_(0, all_orig_idx_t, weighted)
+            if sign_x is not None:
+                # Compute sign ratios s(y)/s(x) WITH gradient tracking
+                sign_y = self.sign_network(all_connected_flow)  # (total_conn,) WITH grad
+                sign_x_expanded = sign_x[all_orig_idx_t]  # (total_conn,) WITH grad
 
-        local_energies = diag + off_diag
-        if local_energies.is_complex():
-            local_energies = local_energies.real
+                # Sign ratio: s(y) / s(x).  Add small eps to avoid division by zero
+                # when s(x) is very close to 0 (early in training).
+                sign_ratio = sign_y / (sign_x_expanded + 1e-8 * sign_x_expanded.sign())
 
-        return local_energies.double()
+                # Convert weighted to float for multiplication with sign_ratio
+                weighted_f = weighted.float().to(flow_device)
+                sign_weighted = weighted_f * sign_ratio.float()
+
+                # Scatter-add the sign-weighted contributions
+                # Use float tensor for grad tracking, then convert back
+                sign_off_diag = torch.zeros(
+                    n_samples, dtype=torch.float32, device=flow_device
+                )
+                sign_off_diag.scatter_add_(
+                    0, all_orig_idx_t.to(flow_device), sign_weighted
+                )
+            else:
+                # No sign network: scatter-add directly
+                off_diag.scatter_add_(0, all_orig_idx_t, weighted)
+
+        if sign_off_diag is not None:
+            # Return with gradient through sign network
+            local_energies = diag.float().to(sign_off_diag.device) + sign_off_diag
+            if local_energies.is_complex():
+                local_energies = local_energies.real
+            return local_energies
+        else:
+            local_energies = diag + off_diag
+            if local_energies.is_complex():
+                local_energies = local_energies.real
+            return local_energies.double()
 
     def train_step(self) -> dict[str, float]:
         """Execute a single VMC optimization step.
 
-        1. Sample configs from the flow (no gradient).
-        2. Recompute log_prob with gradient (teacher forcing).
-        3. Compute local energies (no gradient).
-        4. REINFORCE loss with baseline subtraction.
-        5. Backward, clip, step.
+        Without sign network:
+            1. Sample configs (no grad).
+            2. Recompute log_prob with grad (teacher forcing).
+            3. Compute local energies (no grad).
+            4. REINFORCE loss with baseline.
+            5. Backward, clip, step.
+
+        With sign network:
+            1. Sample configs (no grad).
+            2. Recompute log_prob with grad (for REINFORCE on flow).
+            3. Compute local energies WITH grad through sign network.
+            4. REINFORCE loss for flow (detached E_loc × log_prob).
+            5. Sign loss = E[E_loc] (direct backprop through sign network).
+            6. Combined backward, clip, step.
 
         Returns
         -------
@@ -265,6 +325,8 @@ class VMCTrainer:
             Metrics: 'energy', 'energy_std', 'grad_norm', 'loss'.
         """
         self.flow.train()
+        if self.sign_network is not None:
+            self.sign_network.train()
         cfg = self.config
 
         # Step 1: Sample configs from flow (no gradient for sampling)
@@ -277,13 +339,17 @@ class VMCTrainer:
         configs_for_logprob = configs.float().to(flow_device)
         log_probs_grad = self.flow.log_prob(configs_for_logprob)  # has grad_fn
 
-        # Step 3: Compute local energies (no gradient needed)
-        with torch.no_grad():
+        # Step 3: Compute local energies
+        if self.sign_network is not None:
+            # WITH gradient through sign network
             local_energies = self.compute_local_energies(configs, sample_log_probs)
+        else:
+            with torch.no_grad():
+                local_energies = self.compute_local_energies(configs, sample_log_probs)
 
         # Step 4: REINFORCE loss with EMA baseline
-        energy_mean = local_energies.mean().item()
-        energy_std = local_energies.std(correction=0).item()
+        energy_mean = local_energies.detach().mean().item()
+        energy_std = local_energies.detach().std(correction=0).item()
 
         # Update baseline (EMA)
         if self.energy_baseline is None:
@@ -293,21 +359,29 @@ class VMCTrainer:
                 cfg.baseline_decay * self.energy_baseline + (1.0 - cfg.baseline_decay) * energy_mean
             )
 
-        # Advantage = E_loc(x) - baseline (detached, float64)
-        advantage = local_energies - self.energy_baseline
+        # REINFORCE loss for flow: E[(E_loc - baseline) * log p(x)]
+        # E_loc is always detached for REINFORCE — flow gradient comes from log_prob only.
+        advantage_f = (local_energies.detach() - self.energy_baseline).float().to(flow_device)
+        reinforce_loss = (advantage_f * log_probs_grad).mean()
 
-        # REINFORCE loss: E[(E_loc - b) * log p(x)]
-        # The factor of 2 from psi = sqrt(p) is absorbed:
-        #   nabla <H> = 2 * E[(E_loc - b) * 0.5 * nabla log p]
-        #             = E[(E_loc - b) * nabla log p]
-        # So the loss gradient gives the correct energy gradient.
-        advantage_f = advantage.detach().float().to(flow_device)
-        loss = (advantage_f * log_probs_grad).mean()
+        # Sign loss: E[E_loc] — direct backprop through sign network.
+        # This is correct because ∇_φ <H> = E_p[∇_φ E_loc(x)] (p doesn't depend on φ).
+        if self.sign_network is not None and local_energies.requires_grad:
+            sign_loss = local_energies.mean()
+            total_loss = reinforce_loss + sign_loss
+        else:
+            total_loss = reinforce_loss
 
         # Step 5: Backward + clip + step
         self.optimizer.zero_grad()
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.flow.parameters(), cfg.clip_grad)
+        total_loss.backward()
+
+        # Clip gradients for all parameters
+        all_params = list(self.flow.parameters())
+        if self.sign_network is not None:
+            all_params += list(self.sign_network.parameters())
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, cfg.clip_grad)
+
         self.optimizer.step()
         self.scheduler.step()
 
@@ -315,7 +389,7 @@ class VMCTrainer:
             "energy": energy_mean,
             "energy_std": energy_std,
             "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm),
-            "loss": loss.item(),
+            "loss": total_loss.item(),
         }
 
     def train(self, verbose: bool = True) -> dict[str, Any]:

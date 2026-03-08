@@ -38,6 +38,7 @@ try:
         PhysicsGuidedConfig,
     )
     from .flows.vmc_training import VMCTrainer, VMCConfig
+    from .flows.sign_network import SignNetwork
 except ImportError:
     from flows.particle_conserving_flow import (
         ParticleConservingFlowSampler,
@@ -49,6 +50,7 @@ except ImportError:
         PhysicsGuidedConfig,
     )
     from flows.vmc_training import VMCTrainer, VMCConfig
+    from flows.sign_network import SignNetwork
 
 # NQS components
 try:
@@ -177,6 +179,12 @@ class PipelineConfig:
     vmc_n_steps: int = 500  # VMC optimization steps
     vmc_lr: float = 1e-3  # VMC learning rate
     vmc_n_samples: int = 2000  # Samples per VMC step
+
+    # Sign network for wavefunction sign structure
+    # When True, adds a small feedforward network that learns sign(ψ(x)),
+    # enabling the VMC ansatz ψ(x) = √p(x) × s(x) to represent wavefunctions
+    # with negative CI coefficients.  Requires use_vmc_training=True.
+    use_sign_network: bool = False
 
     # Direct-CI mode: skip NF-NQS training entirely
     # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
@@ -491,6 +499,13 @@ class FlowGuidedKrylovPipeline:
             ).to(self.device)
             print(f"Using particle-conserving flow: " f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons")
 
+        # Sign network for wavefunction sign structure
+        if cfg.use_sign_network and cfg.use_vmc_training:
+            self.sign_network = SignNetwork(num_sites=self.num_sites).to(self.device)
+            print(f"Sign network initialized ({sum(p.numel() for p in self.sign_network.parameters())} params)")
+        else:
+            self.sign_network = None
+
         # Neural Quantum State
         self.nqs = DenseNQS(
             num_sites=self.num_sites,
@@ -725,6 +740,7 @@ class FlowGuidedKrylovPipeline:
             hamiltonian=self.hamiltonian,
             config=vmc_config,
             device=self.device,
+            sign_network=self.sign_network,
         )
 
         vmc_results = vmc_trainer.train(verbose=True)
