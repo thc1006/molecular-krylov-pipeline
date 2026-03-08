@@ -166,36 +166,85 @@ class TransformerDecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward pass with causal masked self-attention.
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward pass with causal masked self-attention and optional KV cache.
+
+        When ``past_kv`` is provided, ``x`` is assumed to contain only the **new**
+        token(s) (typically shape ``(batch, 1, d_model)``).  The cached pre-norm
+        hidden states from previous positions are concatenated with the current
+        token's pre-norm hidden state to form the key/value inputs, while the
+        query is computed only from the new token.  This avoids re-computing
+        attention over the entire prefix at each autoregressive step, reducing
+        total attention work from O(n^3) to O(n^2).
 
         Parameters
         ----------
         x : torch.Tensor
-            (batch, seq_len, d_model)
+            (batch, seq_len, d_model).  When ``past_kv`` is provided, ``seq_len``
+            is typically 1 (the new token).
         attn_mask : torch.Tensor, optional
-            (seq_len, seq_len) additive attention mask (``-inf`` for blocked positions).
+            (seq_len, seq_len) additive attention mask (``-inf`` for blocked
+            positions).  Ignored when ``past_kv`` is provided (the new token
+            attends to all cached positions + itself, no mask needed).
+        past_kv : tuple of (torch.Tensor, torch.Tensor), optional
+            Cached ``(key_states, value_states)`` from previous positions, each
+            of shape ``(batch, past_len, d_model)``.  These are the pre-norm
+            hidden states that were passed as K/V to ``nn.MultiheadAttention``
+            in previous steps.
+        use_cache : bool
+            If True, return ``(output, new_kv)`` where ``new_kv`` is the updated
+            KV cache.  If False (default), return just the output tensor for
+            backward compatibility.
 
         Returns
         -------
-        torch.Tensor
-            (batch, seq_len, d_model)
+        torch.Tensor or (torch.Tensor, tuple)
+            If ``use_cache=False``: ``(batch, seq_len, d_model)`` output tensor.
+            If ``use_cache=True``: ``(output, (new_k, new_v))`` where ``new_k``
+            and ``new_v`` include all positions processed so far.
         """
         # Self-attention with pre-norm
         residual = x
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(
-            x_norm,
-            x_norm,
-            x_norm,
-            attn_mask=attn_mask,
-            is_causal=False,
-        )
+
+        if past_kv is not None:
+            # Incremental decoding: x_norm is only the new token(s).
+            # Concatenate cached K/V states with the new token's states.
+            past_k, past_v = past_kv
+            k_input = torch.cat([past_k, x_norm], dim=1)
+            v_input = torch.cat([past_v, x_norm], dim=1)
+
+            # Query = new token only, Key/Value = all tokens so far.
+            # No attn_mask needed: the new token causally attends to everything
+            # before it plus itself, which is exactly the full k_input.
+            attn_out, _ = self.attn(
+                x_norm,       # query:  (batch, 1, d_model)
+                k_input,      # key:    (batch, past_len+1, d_model)
+                v_input,      # value:  (batch, past_len+1, d_model)
+                is_causal=False,
+            )
+            new_kv = (k_input, v_input) if use_cache else None
+        else:
+            # Full forward (training or first prefix)
+            attn_out, _ = self.attn(
+                x_norm,
+                x_norm,
+                x_norm,
+                attn_mask=attn_mask,
+                is_causal=False,
+            )
+            new_kv = (x_norm, x_norm) if use_cache else None
+
         x = residual + attn_out
 
         # FFN with pre-norm
         residual = x
         x = residual + self.ffn(self.norm2(x))
+
+        if use_cache:
+            return x, new_kv
         return x
 
 
@@ -280,43 +329,79 @@ class AutoregressiveTransformer(nn.Module):
         self,
         input_states: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_kv: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]:
         """Forward pass: compute 4-way logits at each position.
+
+        Supports incremental decoding with KV cache for efficient autoregressive
+        sampling.  When ``past_kv`` is provided and ``use_cache=True``, only the
+        new token(s) are processed, and the KV cache is updated and returned.
 
         Parameters
         ----------
         input_states : torch.Tensor
             (batch, seq_len) long tensor of state ids (0-4).  Typically
             ``[BOS, s_0, s_1, ..., s_{n-2}]`` (length n_orbitals + 1) for teacher
-            forcing, or a partial prefix during autoregressive generation.
+            forcing, or a single new token ``(batch, 1)`` during incremental decode.
         mask : torch.Tensor, optional
             (seq_len, seq_len) additive attention mask.  If None, native causal
-            masking is used (enables Flash Attention on supported hardware).
+            masking is used.  Ignored during incremental decode (``past_kv`` is set).
+        past_kv : tuple of layer KV caches, optional
+            Tuple of length ``n_layers``, where each element is a
+            ``(key_cache, value_cache)`` pair from the previous decode step.
+        use_cache : bool
+            If True, return ``(logits, new_kv_cache)``.  If False (default),
+            return just logits for backward compatibility.
+        start_pos : int
+            Starting position index for positional embeddings.  Used during
+            incremental decode so that the new token gets the correct position
+            embedding (e.g., ``start_pos=5`` for the 6th token in the sequence).
 
         Returns
         -------
-        torch.Tensor
-            (batch, seq_len, 4) logits for next orbital state.
+        torch.Tensor or (torch.Tensor, tuple)
+            If ``use_cache=False``: ``(batch, seq_len, 4)`` logits.
+            If ``use_cache=True``: ``(logits, kv_cache)`` where ``kv_cache`` is
+            a tuple of ``(k, v)`` pairs, one per layer.
         """
         batch_size, seq_len = input_states.shape
         device = input_states.device
 
-        # Embeddings
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
+        # Positional embeddings: use start_pos offset for incremental decode
+        positions = torch.arange(
+            start_pos, start_pos + seq_len, device=device
+        ).unsqueeze(0)  # (1, seq_len)
         x = self.state_embedding(input_states) + self.position_embedding(positions)
 
-        # Causal mask (crop if seq_len < full length)
-        if mask is None:
-            mask = self.causal_mask[:seq_len, :seq_len]
+        # Causal mask: only needed for full forward (not incremental decode)
+        if past_kv is None:
+            if mask is None:
+                mask = self.causal_mask[:seq_len, :seq_len]
+        else:
+            # During incremental decode, the new token attends to all cached
+            # tokens + itself.  No mask is needed (handled by the KV cache
+            # concatenation in the layer).
+            mask = None
 
         # Transformer layers
-        for layer in self.layers:
-            x = layer(x, attn_mask=mask)
+        new_kv_cache: list[Tuple[torch.Tensor, torch.Tensor]] = []
+        for i, layer in enumerate(self.layers):
+            layer_past = past_kv[i] if past_kv is not None else None
+            result = layer(x, attn_mask=mask, past_kv=layer_past, use_cache=use_cache)
+            if use_cache:
+                x, layer_kv = result
+                new_kv_cache.append(layer_kv)
+            else:
+                x = result
 
         # Output projection
         x = self.final_norm(x)
         logits = self.output_head(x)  # (batch, seq_len, 4)
 
+        if use_cache:
+            return logits, tuple(new_kv_cache)
         return logits
 
 
@@ -560,7 +645,13 @@ class AutoregressiveFlowSampler(nn.Module):
 
     @torch.no_grad()
     def _sample_autoregressive(self, n_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate configurations autoregressively with particle conservation masking.
+        """Generate configurations autoregressively with KV-cached decoding.
+
+        Uses KV caching to avoid recomputing attention over the entire prefix
+        at each step.  At step *i*, only the newly sampled token is fed through
+        the transformer, and the cached key/value tensors from all previous
+        layers are reused.  This reduces total attention work from O(n^3) to
+        O(n^2) for the full sequence.
 
         Parameters
         ----------
@@ -590,12 +681,25 @@ class AutoregressiveFlowSampler(nn.Module):
         state_alpha = self._state_alpha  # (4,)
         state_beta = self._state_beta  # (4,)
 
+        # --- Step 0: Process BOS token and initialize KV cache ---
+        bos_token = generated[:, :1]  # (n_samples, 1) — the BOS token
+        logits_bos, kv_cache = self.transformer(bos_token, use_cache=True, start_pos=0)
+        # logits_bos: (n_samples, 1, 4) — logits for orbital 0
+
         for i in range(n_orb):
-            # Forward pass on current prefix (positions 0..i inclusive)
-            prefix = generated[:, : i + 1]
-            logits_all = self.transformer(prefix)  # (batch, i+1, 4)
-            # Logits for position i (the last position in the current sequence)
-            logits_i = logits_all[:, -1, :]  # (batch, 4)
+            if i == 0:
+                # Use logits from the BOS forward pass
+                logits_i = logits_bos[:, -1, :]  # (batch, 4)
+            else:
+                # Incremental forward: process only the newly sampled token
+                new_token = generated[:, i : i + 1]  # (batch, 1)
+                logits_step, kv_cache = self.transformer(
+                    new_token,
+                    past_kv=kv_cache,
+                    use_cache=True,
+                    start_pos=i,
+                )
+                logits_i = logits_step[:, -1, :]  # (batch, 4)
 
             # Apply temperature
             logits_i = logits_i / self.temperature
