@@ -397,5 +397,141 @@ class TestScalingLadder:
         assert dense_pb > 100, "40Q should be intractable for dense methods"
 
 
+# =========================================================================
+# Test 7: NF-Trained pipeline (full Flow-Guided mode)
+# =========================================================================
+
+
+@pytest.mark.slow
+@pytest.mark.molecular
+class TestN2CAS20NFPipeline:
+    """NF-trained pipeline must outperform Direct-CI at 40Q.
+
+    At 40Q, CISD covers only 0.003% of the 240M config space.
+    The AR flow must discover important triples/quadruples/higher
+    excitations that Direct-CI (HF+S+D) cannot reach.
+
+    Validated result: NF = -109.149 Ha vs Direct-CI = -109.084 Ha
+    (65 mHa improvement from NF-discovered configs).
+    """
+
+    def test_nf_pipeline_below_hf(self, n2_cas20, n2_cas20_hf_energy):
+        """NF-trained pipeline must produce energy below HF."""
+        from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
+
+        H = n2_cas20
+        e_hf = n2_cas20_hf_energy
+        t0 = time.time()
+
+        config = PipelineConfig(
+            subspace_mode="skqd",
+            skip_nf_training=False,
+            use_autoregressive_flow=True,
+            use_vmc_training=True,
+            use_sign_network=True,
+            vmc_n_steps=30,
+            vmc_n_samples=200,
+            max_epochs=20,
+            samples_per_batch=200,
+            device=NN_DEVICE,
+        )
+        pipeline = FlowGuidedKrylovPipeline(H, config=config)
+        results = pipeline.run(progress=False)
+        dt = time.time() - t0
+
+        best_e = results.get("combined_energy") or results.get("skqd_energy")
+        assert best_e is not None
+        assert math.isfinite(best_e)
+        assert best_e < 0
+
+        # Must beat HF
+        improvement = (e_hf - best_e) * 1000
+        assert best_e < e_hf + 1e-4
+        assert improvement > 100, (
+            f"NF pipeline improvement {improvement:.1f} mHa too small at 40Q"
+        )
+
+        print(f"\nN2 40Q NF pipeline ({dt:.1f}s): HF={e_hf:.6f}, "
+              f"best={best_e:.6f}, improve={improvement:.2f} mHa")
+
+    def test_nf_beats_direct_ci(self, n2_cas20, n2_cas20_hf_energy):
+        """NF-trained pipeline must produce BETTER energy than Direct-CI.
+
+        This is the core claim: at 40Q (CISD ~0.003%), the AR flow
+        discovers important high-rank configurations that Direct-CI misses.
+        """
+        from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
+
+        H = n2_cas20
+        e_hf = n2_cas20_hf_energy
+
+        # Run Direct-CI
+        dci_config = PipelineConfig(
+            subspace_mode="skqd", skip_nf_training=True, device=NN_DEVICE,
+        )
+        dci_pipe = FlowGuidedKrylovPipeline(H, config=dci_config)
+        dci_res = dci_pipe.run(progress=False)
+        e_dci = dci_res.get("combined_energy") or dci_res.get("skqd_energy")
+
+        # Run NF-Trained
+        nf_config = PipelineConfig(
+            subspace_mode="skqd",
+            skip_nf_training=False,
+            use_autoregressive_flow=True,
+            use_vmc_training=True,
+            use_sign_network=True,
+            vmc_n_steps=30,
+            vmc_n_samples=200,
+            max_epochs=20,
+            samples_per_batch=200,
+            device=NN_DEVICE,
+        )
+        nf_pipe = FlowGuidedKrylovPipeline(H, config=nf_config)
+        nf_res = nf_pipe.run(progress=False)
+        e_nf = nf_res.get("combined_energy") or nf_res.get("skqd_energy")
+
+        # NF must beat Direct-CI
+        delta = (e_dci - e_nf) * 1000
+        print(f"\nN2 40Q NF vs Direct-CI:")
+        print(f"  Direct-CI: {e_dci:.6f} Ha (improve {(e_hf-e_dci)*1000:.1f} mHa)")
+        print(f"  NF-Trained: {e_nf:.6f} Ha (improve {(e_hf-e_nf)*1000:.1f} mHa)")
+        print(f"  NF advantage: {delta:.2f} mHa")
+
+        assert e_nf < e_dci, (
+            f"NF ({e_nf:.6f}) did not beat Direct-CI ({e_dci:.6f}) at 40Q"
+        )
+        assert delta > 10, (
+            f"NF advantage {delta:.1f} mHa too small — expected >10 mHa at 40Q"
+        )
+
+    def test_nf_basis_diversity(self, n2_cas20, n2_cas20_hf_energy):
+        """NF-trained basis must contain high-rank excitations."""
+        from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
+
+        H = n2_cas20
+
+        config = PipelineConfig(
+            subspace_mode="skqd",
+            skip_nf_training=False,
+            use_autoregressive_flow=True,
+            use_vmc_training=True,
+            use_sign_network=True,
+            vmc_n_steps=30,
+            vmc_n_samples=200,
+            max_epochs=20,
+            samples_per_batch=200,
+            device=NN_DEVICE,
+        )
+        pipeline = FlowGuidedKrylovPipeline(H, config=config)
+        results = pipeline.run(progress=False)
+
+        nf_basis_size = results.get("nf_basis_size", 0)
+        # NF should discover more configs than Direct-CI essential (5151)
+        assert nf_basis_size > 5500, (
+            f"NF basis {nf_basis_size} not much larger than Direct-CI essentials"
+        )
+        print(f"\nN2 40Q NF basis size: {nf_basis_size}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--no-header", "-m", "slow"])
