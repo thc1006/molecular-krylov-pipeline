@@ -2505,3 +2505,127 @@ def create_n2_cas_hamiltonian(
     ]
     integrals = compute_molecular_integrals(geometry, basis=basis, cas=cas)
     return MolecularHamiltonian(integrals, device=device)
+
+
+def create_cr2_hamiltonian(
+    bond_length: float = 1.68,
+    basis: str = "sto-3g",
+    cas: Optional[Tuple[int, int]] = (12, 12),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create Cr2 (chromium dimer) Hamiltonian.
+
+    Cr2 has a formal sextuple bond and is one of the most challenging
+    multi-reference systems in quantum chemistry. The 3d electrons on
+    each Cr atom create strong static correlation.
+
+    Default: CAS(12,12) on STO-3G gives 12 active orbitals (3d + 4s)
+    and C(12,6)^2 = 853,776 configurations -- 24 qubits.
+
+    Args:
+        bond_length: Cr-Cr distance in Angstroms (equilibrium ~1.68 A)
+        basis: Basis set (default: sto-3g for method development)
+        cas: (nelecas, ncas) for active space. None = full space.
+        device: Computation device
+
+    Notes:
+        - SCF convergence can be difficult for Cr2; uses max_cycle=300.
+        - CASSCF uses ``fix_spin_(ss=0)`` to target the singlet ground state.
+          Without this constraint, CASSCF converges to the septet (S=3)
+          state which is variationally lower but physically incorrect for
+          the ground-state singlet with sextuple bond character.
+        - CAS(12,12) captures 3d-3d metal bonding (6 electrons from each Cr:
+          3d^5 + 4s^1 = 6 active electrons per atom, 12 total).
+        - Cr2 is a classic benchmark for multi-reference methods due to
+          strong static correlation from the near-degenerate 3d orbitals.
+    """
+    if cas is None:
+        # Full-space (no CAS) -- delegate to compute_molecular_integrals
+        geometry = [
+            ("Cr", (0.0, 0.0, 0.0)),
+            ("Cr", (0.0, 0.0, bond_length)),
+        ]
+        integrals = compute_molecular_integrals(geometry, basis=basis)
+        return MolecularHamiltonian(integrals, device=device)
+
+    # CAS path: custom CASSCF with fix_spin_ to target singlet ground state
+    try:
+        from pyscf import gto, scf, mcscf, fci, ao2mo
+    except ImportError:
+        raise ImportError("PySCF is required for Cr2 Hamiltonian")
+
+    import warnings
+
+    mol = gto.M(
+        atom=f"Cr 0 0 0; Cr 0 0 {bond_length}",
+        basis=basis,
+        spin=0,
+        symmetry=True,
+        verbose=0,
+    )
+
+    mf = scf.RHF(mol)
+    mf.max_cycle = 300
+    mf.kernel()
+
+    if not mf.converged:
+        warnings.warn(
+            f"RHF did not converge for Cr2 (bond_length={bond_length}, basis={basis}). "
+            "Trying ROHF fallback."
+        )
+        mf = scf.ROHF(mol)
+        mf.max_cycle = 300
+        mf.kernel()
+        if not mf.converged:
+            warnings.warn("ROHF also did not converge for Cr2. Results may be unreliable.")
+
+    nelecas, ncas = cas
+
+    mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+
+    # Linear molecules (D_inf_h / C_inf_v) need non-symmetry FCI solver
+    if mol.symmetry and mol.topgroup in ("Dooh", "Coov"):
+        mc.fcisolver = fci.direct_spin1.FCISolver(mol)
+
+    # Cr2 CASSCF without spin constraint converges to septet (S=3, S^2=12)
+    # instead of the singlet ground state. fix_spin_ adds a penalty to
+    # enforce <S^2> = 0 (singlet).
+    mc.fix_spin_(ss=0)
+    mc.kernel()
+
+    if not mc.converged:
+        warnings.warn(
+            f"CASSCF did not converge for Cr2 CAS({nelecas},{ncas}). "
+            "Integrals may be unreliable."
+        )
+
+    # Extract active-space integrals
+    h1e_cas, e_core = mc.h1e_for_cas()
+    active_mo = mc.mo_coeff[:, mc.ncore : mc.ncore + mc.ncas]
+    h2e_cas = ao2mo.full(mol, active_mo)
+    h2e_cas = ao2mo.restore(1, h2e_cas, ncas)
+
+    h1e_cas = np.asarray(h1e_cas, dtype=np.float64)
+    h2e_cas = np.asarray(h2e_cas, dtype=np.float64)
+
+    # Active electron counts
+    if isinstance(nelecas, (tuple, list)):
+        n_alpha_cas = nelecas[0]
+        n_beta_cas = nelecas[1]
+        n_elec_cas = sum(nelecas)
+    else:
+        n_elec_cas = nelecas
+        n_alpha_cas = nelecas // 2
+        n_beta_cas = nelecas // 2
+
+    integrals = MolecularIntegrals(
+        h1e=h1e_cas,
+        h2e=h2e_cas,
+        nuclear_repulsion=float(e_core),
+        n_electrons=n_elec_cas,
+        n_orbitals=ncas,
+        n_alpha=n_alpha_cas,
+        n_beta=n_beta_cas,
+    )
+    return MolecularHamiltonian(integrals, device=device)
