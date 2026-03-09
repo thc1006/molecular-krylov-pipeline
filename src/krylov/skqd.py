@@ -1239,6 +1239,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         """
         Get combined basis from NF and Krylov sampling.
 
+        For NF-guided mode, uses the full expanded basis from Krylov time
+        evolution (self._nf_guided_basis) which includes all configs discovered
+        via get_connections. This avoids the bug where |ψ|²-sampled bitstrings
+        miss new configs that start with zero amplitude.
+
         Args:
             krylov_index: Krylov step index
             include_nf: Whether to include NF-discovered basis
@@ -1246,7 +1251,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         Returns:
             Combined unique basis states
         """
-        # Get Krylov basis
+        # If NF-guided mode was used, the full expanded basis (NF + Krylov-discovered)
+        # is stored in _nf_guided_basis. Use it directly instead of the lossy
+        # krylov_samples path that only captures |ψ|²-sampled subsets.
+        if hasattr(self, '_nf_guided_basis') and self._nf_guided_basis is not None:
+            full_basis = self._nf_guided_basis
+            # Also include any krylov_samples that might not be in the guided basis
+            krylov_basis = self.get_basis_states(krylov_index, cumulative=True)
+            combined = torch.cat([full_basis.to(krylov_basis.device), krylov_basis], dim=0)
+            unique = torch.unique(combined, dim=0)
+            return unique
+
+        # Standard (non-NF-guided) path
         krylov_basis = self.get_basis_states(krylov_index, cumulative=True)
 
         if not include_nf:
