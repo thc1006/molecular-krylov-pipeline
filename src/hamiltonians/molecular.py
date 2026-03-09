@@ -2256,14 +2256,36 @@ def compute_molecular_integrals(
         if mol.symmetry and mol.topgroup in ('Dooh', 'Coov'):
             mc.fcisolver = fci.direct_spin1.FCISolver(mol)
 
-        mc.kernel()
+        # Compute config space size to decide if FCI is feasible.
+        # For CASCI with >50M configs (e.g., CAS(10,20) = 240M), PySCF's
+        # FCI solver is infeasible — skip kernel() and extract integrals only.
+        from math import comb as _comb
 
-        if not casci and not mc.converged:
-            import warnings
-            warnings.warn(
-                f"CASSCF did not converge for CAS({nelecas},{ncas}). "
-                "Integrals may be unreliable."
+        if isinstance(nelecas, (tuple, list)):
+            _na, _nb = nelecas[0], nelecas[1]
+        else:
+            _na = (nelecas + spin) // 2
+            _nb = (nelecas - spin) // 2
+        _n_configs = _comb(ncas, _na) * _comb(ncas, _nb)
+        _FCI_CONFIG_LIMIT = 50_000_000  # 50M configs
+
+        if casci and _n_configs > _FCI_CONFIG_LIMIT:
+            # Integrals-only mode: h1e_for_cas() and ao2mo work without
+            # kernel() because CASCI sets mo_coeff = mf.mo_coeff at __init__.
+            print(
+                f"[CAS] Skipping FCI solve for CAS({nelecas},{ncas}): "
+                f"{_n_configs:,} configs > {_FCI_CONFIG_LIMIT:,} limit. "
+                f"Extracting integrals only."
             )
+        else:
+            mc.kernel()
+
+            if not casci and not mc.converged:
+                import warnings
+                warnings.warn(
+                    f"CASSCF did not converge for CAS({nelecas},{ncas}). "
+                    "Integrals may be unreliable."
+                )
 
         # h1e_for_cas returns (h1e_cas, e_core)
         # e_core = nuclear_repulsion + frozen core energy
