@@ -421,7 +421,7 @@ class NNCIActiveLearning:
                 break
 
             _, top_indices = torch.topk(scores, n_to_add)
-            new_configs = candidates[top_indices]
+            new_configs = candidates[top_indices].to(self.basis.device)
 
             # 5. Expand basis
             self.basis = torch.cat([self.basis, new_configs], dim=0)
@@ -487,16 +487,17 @@ class NNCIActiveLearning:
             Trained classifier.
         """
         cfg = self.config
+        device = basis.device
         clf = ConfigImportanceClassifier(
             n_sites=self.n_sites,
             hidden_dims=cfg.hidden_dims,
-        )
+        ).to(device)
 
         optimizer = torch.optim.Adam(clf.parameters(), lr=cfg.learning_rate)
         criterion = nn.MSELoss()
 
         configs_float = basis.float()
-        labels = torch.from_numpy(ci_coeffs).float().unsqueeze(1)
+        labels = torch.from_numpy(ci_coeffs).float().unsqueeze(1).to(device)
 
         clf.train()
         for _ in range(cfg.training_epochs):
@@ -552,5 +553,6 @@ class NNCIActiveLearning:
         torch.Tensor
             Importance scores, shape (n_candidates,).
         """
-        scores = clf(candidates.float())
-        return scores.squeeze(1)
+        device = next(clf.parameters()).device
+        scores = clf(candidates.float().to(device))
+        return scores.squeeze(1).cpu()

@@ -57,29 +57,28 @@ N_BETA = 5
 NUM_SITES = 24
 TOTAL_CONFIGS = 627264
 
+# Device strategy: Hamiltonian on CPU (FP64 Numba JIT), NN on GPU (TF32).
+NN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_cas12_sampler(n_orbitals, n_alpha, n_beta):
-    """Build a compact AR flow for CAS(10,12) tests.
-
-    Uses a small transformer (2 layers, 2 heads, d_model=32) to keep
-    test time reasonable while exercising the autoregressive machinery
-    on a 24-qubit system.
-    """
+def _make_cas12_sampler(n_orbitals, n_alpha, n_beta, device=NN_DEVICE):
+    """Build a compact AR flow for CAS(10,12) tests, on GPU if available."""
     num_sites = 2 * n_orbitals
     config = AutoregressiveConfig(
         n_layers=2, n_heads=2, d_model=32, d_ff=64, dropout=0.0,
     )
-    return AutoregressiveFlowSampler(
+    flow = AutoregressiveFlowSampler(
         num_sites=num_sites,
         n_alpha=n_alpha,
         n_beta=n_beta,
         transformer_config=config,
     )
+    return flow.to(device)
 
 
 def _count_excitation_rank(config, hf_state):
@@ -328,7 +327,7 @@ class TestCAS12VMCConvergence:
             n_alpha=H.n_alpha,
             n_beta=H.n_beta,
         )
-        sign_net = SignNetwork(num_sites=H.num_sites)
+        sign_net = SignNetwork(num_sites=H.num_sites).to(NN_DEVICE)
 
         vmc_cfg = VMCConfig(
             n_samples=200,
@@ -340,7 +339,7 @@ class TestCAS12VMCConvergence:
             flow=flow,
             hamiltonian=H,
             config=vmc_cfg,
-            device="cpu",
+            device=NN_DEVICE,
             sign_network=sign_net,
         )
 
@@ -421,7 +420,7 @@ class TestCAS12BasisDiversity:
 
         with torch.no_grad():
             states, _ = flow._sample_autoregressive(1000)
-            ar_configs = states_to_configs(states, flow.n_orbitals)
+            ar_configs = states_to_configs(states, flow.n_orbitals).cpu()
 
         # Classify excitation ranks
         hf_long = hf_state.long()
@@ -510,7 +509,7 @@ class TestCAS12FullPipeline:
             vmc_n_steps=30,
             vmc_n_samples=200,
             skip_nf_training=True,
-            device="cpu",
+            device=NN_DEVICE,
         )
         pipeline = FlowGuidedKrylovPipeline(
             H,
@@ -638,7 +637,7 @@ class TestCAS12VariationalImprovement:
         config = PipelineConfig(
             subspace_mode="skqd",
             skip_nf_training=True,
-            device="cpu",
+            device=NN_DEVICE,
         )
         pipeline = FlowGuidedKrylovPipeline(
             H,

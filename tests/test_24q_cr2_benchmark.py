@@ -52,24 +52,28 @@ N_BETA = 6
 NUM_SITES = 24
 TOTAL_CONFIGS = 853776  # C(12,6)^2 = 924^2
 
+# Device strategy: Hamiltonian on CPU (FP64 Numba JIT), NN on GPU (TF32).
+NN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_cr2_sampler(n_orbitals, n_alpha, n_beta):
-    """Build a compact AR flow for Cr2 CAS(12,12) tests."""
+def _make_cr2_sampler(n_orbitals, n_alpha, n_beta, device=NN_DEVICE):
+    """Build a compact AR flow for Cr2 CAS(12,12) tests, on GPU if available."""
     num_sites = 2 * n_orbitals
     config = AutoregressiveConfig(
         n_layers=2, n_heads=2, d_model=32, d_ff=64, dropout=0.0,
     )
-    return AutoregressiveFlowSampler(
+    flow = AutoregressiveFlowSampler(
         num_sites=num_sites,
         n_alpha=n_alpha,
         n_beta=n_beta,
         transformer_config=config,
     )
+    return flow.to(device)
 
 
 def _compute_cisd_count(n_orb, n_alpha, n_beta):
@@ -267,7 +271,7 @@ class TestCr2ARFlowSamples:
 
         with torch.no_grad():
             states, _ = flow._sample_autoregressive(1000)
-            configs = states_to_configs(states, flow.n_orbitals)
+            configs = states_to_configs(states, flow.n_orbitals).cpu()
 
         hf_long = hf_state.long()
         ranks = [_count_excitation_rank(c, hf_long) for c in configs.long()]
@@ -311,7 +315,7 @@ class TestCr2FullPipeline:
         config = PipelineConfig(
             subspace_mode="skqd",
             skip_nf_training=True,
-            device="cpu",
+            device=NN_DEVICE,
         )
         pipeline = FlowGuidedKrylovPipeline(H, config=config)
         results = pipeline.run(progress=False)

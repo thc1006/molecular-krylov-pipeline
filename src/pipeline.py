@@ -642,7 +642,8 @@ class FlowGuidedKrylovPipeline:
         essential_tensor = torch.stack(essential).to(self.device)
         essential_tensor = torch.unique(essential_tensor, dim=0)
 
-        n_singles = sum(1 for c in essential_tensor if torch.sum(torch.abs(c - hf_state)) == 2)
+        hf_dev = hf_state.to(essential_tensor.device)
+        n_singles = sum(1 for c in essential_tensor if torch.sum(torch.abs(c - hf_dev)) == 2)
         n_doubles = len(essential_tensor) - n_singles - 1
 
         print(

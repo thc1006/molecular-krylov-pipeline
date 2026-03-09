@@ -52,23 +52,27 @@ N_BETA = 5
 NUM_SITES = 40
 TOTAL_CONFIGS = 240374016  # C(20,5)^2 = 15504^2
 
+# Device strategy: Hamiltonian on CPU (FP64 Numba JIT), NN on GPU (TF32).
+NN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_40q_sampler(n_orbitals, n_alpha, n_beta):
-    """Build a compact AR flow for 40Q tests."""
+def _make_40q_sampler(n_orbitals, n_alpha, n_beta, device=NN_DEVICE):
+    """Build a compact AR flow for 40Q tests, on GPU if available."""
     config = AutoregressiveConfig(
         n_layers=2, n_heads=2, d_model=32, d_ff=64, dropout=0.0,
     )
-    return AutoregressiveFlowSampler(
+    flow = AutoregressiveFlowSampler(
         num_sites=2 * n_orbitals,
         n_alpha=n_alpha,
         n_beta=n_beta,
         transformer_config=config,
     )
+    return flow.to(device)
 
 
 def _compute_cisd_count(n_orb, n_alpha, n_beta):
@@ -256,7 +260,7 @@ class TestN2CAS20ARFlow:
         flow = _make_40q_sampler(H.n_orbitals, H.n_alpha, H.n_beta)
         with torch.no_grad():
             states, _ = flow._sample_autoregressive(1000)
-            configs = states_to_configs(states, flow.n_orbitals)
+            configs = states_to_configs(states, flow.n_orbitals).cpu()
         hf_long = n2_cas20_hf.long()
         ranks = [_count_excitation_rank(c, hf_long) for c in configs.long()]
         rank_counts = {}
@@ -288,12 +292,12 @@ class TestN2CAS20VMC:
         H = n2_cas20
         torch.manual_seed(42)
         flow = _make_40q_sampler(H.n_orbitals, H.n_alpha, H.n_beta)
-        sign_net = SignNetwork(num_sites=H.num_sites)
+        sign_net = SignNetwork(num_sites=H.num_sites).to(NN_DEVICE)
 
         vmc_cfg = VMCConfig(n_samples=200, n_steps=30, lr=2e-3, min_steps=30)
         trainer = VMCTrainer(
             flow=flow, hamiltonian=H, config=vmc_cfg,
-            device="cpu", sign_network=sign_net,
+            device=NN_DEVICE, sign_network=sign_net,
         )
         t0 = time.time()
         result = trainer.train(verbose=False)
@@ -328,7 +332,7 @@ class TestN2CAS20Pipeline:
         t0 = time.time()
 
         config = PipelineConfig(
-            subspace_mode="skqd", skip_nf_training=True, device="cpu",
+            subspace_mode="skqd", skip_nf_training=True, device=NN_DEVICE,
         )
         pipeline = FlowGuidedKrylovPipeline(H, config=config)
         results = pipeline.run(progress=False)
