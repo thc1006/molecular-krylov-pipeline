@@ -864,14 +864,17 @@ class PhysicsGuidedFlowTrainer:
 
         with torch.no_grad():
             # Step 1: Get diagonal elements (already vectorized and efficient)
-            diag = self.hamiltonian.diagonal_elements_batch(configs)
+            diag = self.hamiltonian.diagonal_elements_batch(configs).to(self.device)
 
             # Fast path: diagonal-only mode for warmup
             if diagonal_only:
                 return diag
 
-            # Step 2: Get ALL connections
+            # Step 2: Get ALL connections (may be on Hamiltonian's device, move to trainer's)
             all_connected, all_elements, all_orig_indices = self._get_connections_batch(configs)
+            all_connected = all_connected.to(self.device)
+            all_elements = all_elements.to(self.device)
+            all_orig_indices = all_orig_indices.to(self.device)
 
             # If no off-diagonal connections, return diagonal energies
             if len(all_connected) == 0:
