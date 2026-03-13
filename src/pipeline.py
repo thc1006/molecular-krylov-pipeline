@@ -21,6 +21,7 @@ Usage:
     results = pipeline.run()
 """
 
+import gc
 import torch
 import numpy as np
 from typing import Optional, Dict, Any
@@ -38,7 +39,7 @@ try:
         PhysicsGuidedConfig,
     )
     from .flows.vmc_training import VMCTrainer, VMCConfig
-    from .flows.sign_network import SignNetwork
+    from .flows.sign_network import SignNetwork, PhaseNetwork
 except ImportError:
     from flows.particle_conserving_flow import (
         ParticleConservingFlowSampler,
@@ -50,7 +51,7 @@ except ImportError:
         PhysicsGuidedConfig,
     )
     from flows.vmc_training import VMCTrainer, VMCConfig
-    from flows.sign_network import SignNetwork
+    from flows.sign_network import SignNetwork, PhaseNetwork
 
 # NQS components
 try:
@@ -112,6 +113,10 @@ class PipelineConfig:
 
     # NF-NQS architecture
     nf_hidden_dims: list = field(default_factory=lambda: [256, 256])
+    # Top-k selector type for particle-conserving flow.
+    # "sigmoid": deterministic, exact gradients (default).
+    # "gumbel": stochastic Gumbel noise, better exploration at high temperature.
+    topk_type: str = "sigmoid"
     nqs_hidden_dims: list = field(default_factory=lambda: [256, 256, 256, 256])
 
     # Training parameters
@@ -167,6 +172,10 @@ class PipelineConfig:
     use_nnci: Optional[bool] = None
     nnci_iterations: int = 5  # Active learning iterations
     nnci_candidates_per_iter: int = 5000  # Max candidates to generate per iteration
+    # Natural orbital (NO) prioritization for NNCI candidate generation (P2.2).
+    # Restricts excitations to the most correlated orbitals from MP2 1-RDM.
+    nnci_use_natural_orbitals: bool = False
+    nnci_no_max_active_orbitals: int = 0  # 0 = all orbitals
 
     # Training mode
     use_local_energy: bool = True  # Use VMC local energy (proper variational estimator)
@@ -175,26 +184,59 @@ class PipelineConfig:
     # When True, after NF training (or instead of it), runs VMC to directly minimize
     # the variational energy <psi|H|psi> using REINFORCE on the autoregressive flow.
     # Requires use_autoregressive_flow=True.
+    #
+    # DEFAULT OFF: Two reasons —
+    #   1. NQS-SC (selected configs + diagonalization) outperforms NQS-VMC for
+    #      ground-state energy (arXiv:2602.12993, ETH Zurich Feb 2026).  Our
+    #      Direct-CI + SKQD pipeline IS the NQS-SC approach.
+    #   2. Current VMCTrainer uses REINFORCE, which does not converge beyond ~16Q.
+    #      The field standard is MinSR / SPRING (Rende et al., 2024).  VMC should
+    #      remain off until REINFORCE is replaced with a proper SR-family optimizer.
     use_vmc_training: bool = False
     vmc_n_steps: int = 500  # VMC optimization steps
     vmc_lr: float = 1e-3  # VMC learning rate
     vmc_n_samples: int = 2000  # Samples per VMC step
 
-    # Sign network for wavefunction sign structure
-    # When True, adds a small feedforward network that learns sign(ψ(x)),
-    # enabling the VMC ansatz ψ(x) = √p(x) × s(x) to represent wavefunctions
-    # with negative CI coefficients.  Requires use_vmc_training=True.
+    # Sign/phase network for wavefunction sign structure.
+    # When True, adds a network that learns sign or phase of ψ(x).
+    # Requires use_vmc_training=True.
+    # DEFAULT OFF: Coupled to VMC — no value without a working VMC optimizer.
     use_sign_network: bool = False
+
+    # Architecture for sign/phase network.
+    # "sign": SignNetwork with tanh ∈ (-1,1) — legacy, gradient issues at boundaries.
+    # "phase": PhaseNetwork with 2π·sigmoid → e^{iφ} — smooth gradient, subsumes sign.
+    sign_architecture: str = "phase"
 
     # Direct-CI mode: skip NF-NQS training entirely
     # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
     # None = auto (let adapt_to_system_size decide based on system size)
     skip_nf_training: Optional[bool] = None
 
+    # === ITERATIVE REFINEMENT (HAAR-SCI/GTNN-SCI/CIGS inspired) ===
+    # After SKQD diag, extract eigenstate and retrain NF with H-coupling guidance.
+    # Iteration 1 = original single-shot pipeline. Iterations 2+ use warm-started
+    # NF + eigenstate H-coupling reward to discover new important configurations.
+    n_refinement_iterations: int = 1  # 1 = single-shot (default, backward compat)
+    refinement_convergence_threshold: float = 1e-4  # Stop when dE < threshold (Ha)
+    refinement_epochs: int = 0  # NF epochs for iteration 2+ (0 = max_epochs // 2)
+    h_coupling_weight: float = 0.1  # H-coupling reward weight for NF refinement
+    h_coupling_n_ref: int = 50  # Number of top eigenstate configs for coupling
+
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def __post_init__(self):
+        # Validate enum-like string parameters
+        if self.topk_type not in ("sigmoid", "gumbel"):
+            raise ValueError(
+                f"Unknown topk_type '{self.topk_type}'. Use 'sigmoid' or 'gumbel'."
+            )
+        if self.sign_architecture not in ("sign", "phase"):
+            raise ValueError(
+                f"Unknown sign_architecture '{self.sign_architecture}'. Use 'sign' or 'phase'."
+            )
+
         # Track if user explicitly set skip_nf_training (True or False)
         # so adapt_to_system_size() won't override their choice.
         if self.skip_nf_training is not None:
@@ -496,13 +538,19 @@ class FlowGuidedKrylovPipeline:
                 n_alpha=n_alpha,
                 n_beta=n_beta,
                 hidden_dims=cfg.nf_hidden_dims,
+                topk_type=cfg.topk_type,
             ).to(self.device)
             print(f"Using particle-conserving flow: " f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons")
 
-        # Sign network for wavefunction sign structure
+        # Sign/phase network for wavefunction sign structure
         if cfg.use_sign_network and cfg.use_vmc_training:
-            self.sign_network = SignNetwork(num_sites=self.num_sites).to(self.device)
-            print(f"Sign network initialized ({sum(p.numel() for p in self.sign_network.parameters())} params)")
+            if cfg.sign_architecture == "phase":
+                self.sign_network = PhaseNetwork(num_sites=self.num_sites).to(self.device)
+                arch_name = "PhaseNetwork (e^{iφ})"
+            else:
+                self.sign_network = SignNetwork(num_sites=self.num_sites).to(self.device)
+                arch_name = "SignNetwork (tanh)"
+            print(f"{arch_name} initialized ({sum(p.numel() for p in self.sign_network.parameters())} params)")
         else:
             if cfg.use_sign_network and not cfg.use_vmc_training:
                 print("WARNING: use_sign_network=True requires use_vmc_training=True. Sign network not created.")
@@ -890,6 +938,8 @@ class FlowGuidedKrylovPipeline:
                     training_epochs=100,
                     convergence_threshold=1e-6,
                     max_basis_size=min(cfg.max_diag_basis_size, 15000),
+                    use_natural_orbitals=cfg.nnci_use_natural_orbitals,
+                    no_max_active_orbitals=cfg.nnci_no_max_active_orbitals,
                 )
 
                 nnci = NNCIActiveLearning(
@@ -934,6 +984,8 @@ class FlowGuidedKrylovPipeline:
             nf_basis=nf_basis,
             config=skqd_config,
         )
+        # Store for eigenstate extraction during iterative refinement
+        self._last_skqd = skqd
 
         results = skqd.run_with_nf(progress=progress)
 
@@ -1024,6 +1076,11 @@ class FlowGuidedKrylovPipeline:
         """
         Run complete pipeline.
 
+        Supports iterative refinement when ``n_refinement_iterations > 1``:
+        1. Iteration 1: standard pipeline (Direct-CI or NF → basis → SKQD)
+        2. Iterations 2+: extract eigenstate → retrain NF with H-coupling → SKQD
+        3. Stop when energy converges or max iterations reached
+
         Args:
             progress: Show progress bars
 
@@ -1039,25 +1096,266 @@ class FlowGuidedKrylovPipeline:
             print(f"Electrons: {self.hamiltonian.n_alpha}α + {self.hamiltonian.n_beta}β")
         if self.exact_energy is not None:
             print(f"Exact energy: {self.exact_energy:.8f}")
+        n_iters = self.config.n_refinement_iterations
+        if n_iters > 1:
+            print(f"Iterative refinement: up to {n_iters} iterations")
         print("=" * 60 + "\n")
 
-        # Stage 1: Training
+        # === Iteration 1: standard pipeline ===
         self.train_flow_nqs(progress=progress)
 
-        # Stage 1b (optional): VMC training
         if self.config.use_vmc_training:
             self._run_vmc_training()
 
-        # Stage 2: Basis extraction
         self.extract_and_select_basis()
-
-        # Stage 3: Subspace diagonalization (SKQD or SQD)
         self.run_subspace_diag(progress=progress)
+
+        # === Iterations 2+: iterative refinement ===
+        if n_iters > 1:
+            prev_energy = self.results.get("combined_energy", float("inf"))
+            self.results["refinement_energies"] = [prev_energy]
+
+            for iteration in range(2, n_iters + 1):
+                print(f"\n{'=' * 60}")
+                print(f"Refinement Iteration {iteration}/{n_iters}")
+                print(f"{'=' * 60}")
+
+                # Extract eigenstate from SKQD for H-coupling guidance
+                eigenstate_basis, eigenstate_coeffs = self._extract_eigenstate()
+
+                # Free previous iteration's GPU memory before allocating new
+                self._cleanup_iteration()
+                if eigenstate_basis is None:
+                    print("WARNING: Cannot extract eigenstate. Stopping refinement.")
+                    break
+
+                # Ensure flow is initialized (may be None from Direct-CI)
+                self._ensure_flow_initialized()
+
+                # Retrain NF with H-coupling guidance (warm-started weights)
+                self._retrain_with_eigenstate(
+                    eigenstate_basis, eigenstate_coeffs, progress=progress
+                )
+
+                # Re-extract basis and re-run SKQD
+                self.extract_and_select_basis()
+
+                # Merge previous iteration's Krylov-expanded basis to ensure
+                # monotonic energy improvement (variational principle).
+                # Without this, diversity selection can discard critical configs
+                # that Krylov discovered in the previous iteration.
+                if self.nf_basis is not None and eigenstate_basis is not None:
+                    prev_basis = eigenstate_basis.to(self.nf_basis.device)
+                    merged = torch.cat([self.nf_basis, prev_basis], dim=0)
+                    self.nf_basis = torch.unique(merged, dim=0)
+                    print(
+                        f"Merged previous Krylov basis: "
+                        f"{len(self.nf_basis)} total configs"
+                    )
+
+                self.run_subspace_diag(progress=progress)
+
+                # Convergence check
+                current_energy = self.results.get("combined_energy", float("inf"))
+                self.results["refinement_energies"].append(current_energy)
+                improvement = prev_energy - current_energy
+                print(f"Energy improvement: {improvement * 1000:.4f} mHa")
+
+                if abs(improvement) < self.config.refinement_convergence_threshold:
+                    print(
+                        f"Converged: |improvement| {abs(improvement) * 1000:.4f} mHa "
+                        f"< threshold {self.config.refinement_convergence_threshold * 1000:.4f} mHa"
+                    )
+                    break
+                prev_energy = min(prev_energy, current_energy)
 
         # Summary
         self._print_summary()
 
         return self.results
+
+    def _extract_eigenstate(self):
+        """Extract eigenstate (basis + coefficients) from last SKQD run.
+
+        Returns:
+            (basis, coefficients) or (None, None) if extraction fails.
+        """
+        skqd = getattr(self, "_last_skqd", None)
+        if skqd is None:
+            return None, None
+
+        try:
+            # Clamp k to actual number of Krylov steps generated.
+            # If Krylov expansion converged early (energy convergence or ill-conditioning),
+            # krylov_samples has fewer entries than max_krylov_dim, causing IndexError.
+            n_krylov_actual = len(getattr(skqd, "krylov_samples", []))
+            if n_krylov_actual == 0:
+                # Krylov expansion didn't run; fall back to NF basis alone
+                combined_basis = skqd.nf_basis
+            else:
+                k = min(skqd.config.max_krylov_dim - 1, n_krylov_actual - 1)
+                combined_basis = skqd.get_combined_basis(k, include_nf=True)
+
+            # Recompute with eigenvector
+            E0, v0 = skqd.compute_ground_state_energy(
+                basis=combined_basis,
+                return_eigenvector=True,
+                regularization=skqd.config.regularization,
+            )
+            print(f"Extracted eigenstate: E={E0:.6f} Ha, basis={len(combined_basis)} configs")
+            return combined_basis, v0.detach().cpu().numpy()
+        except Exception as e:
+            print(f"WARNING: eigenstate extraction failed: {e}")
+            return None, None
+
+    def _ensure_flow_initialized(self):
+        """Lazily initialize the flow for refinement iterations.
+
+        When the first iteration was Direct-CI, no flow exists.
+        Creates one for the refinement loop.
+        """
+        if self.flow is not None:
+            return
+
+        cfg = self.config
+        n_alpha = self.hamiltonian.n_alpha
+        n_beta = self.hamiltonian.n_beta
+
+        # Default to autoregressive for refinement (better expressivity)
+        if cfg.use_autoregressive_flow or cfg.use_autoregressive_flow is None:
+            self.flow = AutoregressiveFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+            ).to(self.device)
+            cfg.use_autoregressive_flow = True
+            print(
+                f"Initialized AR flow for refinement: "
+                f"{n_alpha}α + {n_beta}β electrons"
+            )
+        else:
+            self.flow = ParticleConservingFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+                hidden_dims=cfg.nf_hidden_dims,
+                topk_type=cfg.topk_type,
+            ).to(self.device)
+            print(f"Initialized PCF flow for refinement")
+
+    def _retrain_with_eigenstate(
+        self,
+        eigenstate_basis: torch.Tensor,
+        eigenstate_coeffs,
+        progress: bool = True,
+    ):
+        """Retrain NF with H-coupling guidance from the eigenstate.
+
+        Creates a new PhysicsGuidedFlowTrainer that reuses the same flow/NQS
+        weights (warm start) but adds H-coupling reward from the eigenstate.
+
+        Args:
+            eigenstate_basis: (n, n_sites) basis configs from SKQD
+            eigenstate_coeffs: (n,) eigenstate coefficients
+            progress: Show progress bars
+        """
+        print("=" * 60)
+        print("Refinement: Retraining NF with H-coupling guidance")
+        print("=" * 60)
+
+        cfg = self.config
+        refinement_epochs = cfg.refinement_epochs or max(cfg.max_epochs // 2, 50)
+
+        # NF training is forced on during refinement — keep skip_nf_training=False
+        # so extract_and_select_basis() uses the NF's accumulated basis
+        cfg.skip_nf_training = False
+
+        # Entropy regularization prevents NF mode collapse during refinement.
+        # H-coupling provides a NEW signal beyond cross-entropy, but the NF
+        # still collapses quickly without entropy to maintain exploration.
+        # 0.05 is sufficient — higher values (0.1) degrade accuracy without
+        # improving unique ratio (mode collapse is fundamental to cross-entropy loss).
+        refinement_entropy = max(cfg.entropy_weight, 0.05)
+
+        train_config = PhysicsGuidedConfig(
+            samples_per_batch=cfg.samples_per_batch,
+            num_batches=cfg.num_batches,
+            flow_lr=cfg.nf_lr,
+            nqs_lr=cfg.nqs_lr,
+            num_epochs=refinement_epochs,
+            min_epochs=min(refinement_epochs, cfg.min_epochs),
+            convergence_threshold=cfg.convergence_threshold,
+            teacher_weight=cfg.teacher_weight,
+            physics_weight=cfg.physics_weight,
+            entropy_weight=refinement_entropy,
+            max_accumulated_basis=cfg.max_accumulated_basis,
+            max_connections_per_config=cfg.max_connections_per_config,
+            diagonal_only_warmup_epochs=cfg.diagonal_only_warmup_epochs,
+            stochastic_connections_fraction=cfg.stochastic_connections_fraction,
+            # H-coupling guidance
+            h_coupling_weight=cfg.h_coupling_weight,
+            h_coupling_n_ref=cfg.h_coupling_n_ref,
+        )
+
+        # Explicitly free old trainer's GPU resources before creating new one
+        old_trainer = getattr(self, 'trainer', None)
+        if old_trainer is not None:
+            del self.trainer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self.trainer = PhysicsGuidedFlowTrainer(
+            flow=self.flow,  # warm-started from previous iteration
+            nqs=self.nqs,  # warm-started from previous iteration
+            hamiltonian=self.hamiltonian,
+            config=train_config,
+            device=self.device,
+        )
+
+        # Set eigenstate reference for H-coupling guidance
+        self.trainer.set_eigenstate_reference(eigenstate_basis, eigenstate_coeffs)
+
+        # Seed accumulated basis with previous iteration's combined basis.
+        # This ensures the NF only ADDS to the existing best basis, never replaces it.
+        # Without this, the NF would generate a different config set that may miss
+        # important Krylov-discovered configs, violating the variational principle.
+        self.trainer.accumulated_basis = eigenstate_basis.to(self.device)
+        print(f"Seeded accumulated basis with {len(eigenstate_basis)} configs from previous SKQD")
+
+        history = self.trainer.train()
+
+        self.results["refinement_training_history"] = history
+
+    def _cleanup_iteration(self):
+        """Release GPU memory between refinement iterations.
+
+        Critical on UMA (DGX Spark) where CUDA cached memory = system RAM.
+        Without explicit cleanup, each iteration accumulates GPU allocations
+        that starve subsequent iterations and risk OOM kill.
+        """
+        # Delete old trainer's ConnectionCache and accumulated tensors
+        old_trainer = getattr(self, 'trainer', None)
+        if old_trainer is not None:
+            if hasattr(old_trainer, 'connection_cache'):
+                del old_trainer.connection_cache
+            if hasattr(old_trainer, 'accumulated_basis'):
+                del old_trainer.accumulated_basis
+
+        # Clear stale SKQD state (krylov_samples, H_subspace, etc.)
+        old_skqd = getattr(self, '_last_skqd', None)
+        if old_skqd is not None:
+            for attr in ('H_subspace', 'krylov_samples', 'nf_basis'):
+                if hasattr(old_skqd, attr):
+                    try:
+                        delattr(old_skqd, attr)
+                    except Exception:
+                        pass
+
+        # Force Python GC + return CUDA cached memory to OS
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _print_summary(self):
         """Print results summary."""
@@ -1065,8 +1363,13 @@ class FlowGuidedKrylovPipeline:
         print("Results Summary")
         print("=" * 60)
 
-        if self.results.get("skip_nf_training"):
+        refinement_energies = self.results.get("refinement_energies")
+        if refinement_energies and len(refinement_energies) > 1:
+            print(f"Mode:              Iterative Refinement ({len(refinement_energies)} iterations)")
+        elif self.results.get("skip_nf_training"):
             print(f"Mode:              Direct-CI (NF training skipped)")
+        else:
+            print(f"Mode:              NF-Guided")
 
         mode_label = self.config.subspace_mode.upper()
         if self.config.subspace_mode == "sqd":
@@ -1104,6 +1407,15 @@ class FlowGuidedKrylovPipeline:
                     print("Chemical accuracy: PASS")
                 else:
                     print("Chemical accuracy: FAIL")
+
+        if refinement_energies and len(refinement_energies) > 1:
+            print("\nRefinement trajectory:")
+            for i, e in enumerate(refinement_energies):
+                if self.exact_energy is not None:
+                    err = abs(e - self.exact_energy) * 1000
+                    print(f"  Iter {i + 1}: {e:.8f} Ha ({err:.3f} mHa)")
+                else:
+                    print(f"  Iter {i + 1}: {e:.8f} Ha")
 
         print("=" * 60)
 

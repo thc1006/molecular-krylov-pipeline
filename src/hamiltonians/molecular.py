@@ -446,6 +446,12 @@ class MolecularHamiltonian(Hamiltonian):
         device: Torch device for GPU acceleration
     """
 
+    # Maximum config count for FCI computation.
+    # CAS(10,12) = 427K is feasible; CAS(10,15) = 9M is not.
+    # On 128 GB UMA, ~500K configs × 3500 connections × 256 bytes ≈ 430 GB — already too large.
+    # Conservative limit to prevent OOM on UMA systems.
+    MAX_FCI_CONFIGS = 500_000
+
     def __init__(
         self,
         integrals: MolecularIntegrals,
@@ -683,6 +689,34 @@ class MolecularHamiltonian(Hamiltonian):
             self._powers_gpu_lo = (
                 2 ** torch.arange(n_lo, device=device, dtype=torch.long)
             ).flip(0)
+
+    def estimate_connections_per_config(self) -> int:
+        """Estimate the upper-bound number of Hamiltonian connections per config.
+
+        Uses combinatorial formula based on (n_orb, n_alpha, n_beta):
+          singles = n_alpha*(n_orb - n_alpha) + n_beta*(n_orb - n_beta)
+          same-spin doubles = C(n_alpha,2)*C(n_orb-n_alpha,2) * 2  (alpha-alpha + beta-beta)
+          alpha-beta doubles = n_alpha*(n_orb-n_alpha) * n_beta*(n_orb-n_beta)
+        """
+        from math import comb
+        n_orb = self.n_orbitals
+        n_a, n_b = self.n_alpha, self.n_beta
+        singles = n_a * (n_orb - n_a) + n_b * (n_orb - n_b)
+        same_doubles = comb(n_a, 2) * comb(n_orb - n_a, 2) + comb(n_b, 2) * comb(n_orb - n_b, 2)
+        ab_doubles = n_a * (n_orb - n_a) * n_b * (n_orb - n_b)
+        return singles + same_doubles + ab_doubles
+
+    def estimate_fci_memory_mb(self) -> float:
+        """Estimate memory (MB) needed by get_connections_vectorized_batch for FCI.
+
+        Each connection stores: config (num_sites * 8) + element (8) + batch_idx (8) bytes.
+        Total = n_configs * connections_per_config * bytes_per_connection.
+        """
+        from math import comb
+        n_configs = comb(self.n_orbitals, self.n_alpha) * comb(self.n_orbitals, self.n_beta)
+        conn_per_config = self.estimate_connections_per_config()
+        bytes_per_conn = self.num_sites * 8 + 8 + 8  # config + element + batch_idx
+        return n_configs * conn_per_config * bytes_per_conn / 1e6
 
     def _config_int_hash(self, configs: torch.Tensor) -> list:
         """Hash binary configs to integers for fast dict/set lookups.
@@ -1189,23 +1223,31 @@ class MolecularHamiltonian(Hamiltonian):
 
     @torch.no_grad()
     def get_connections_vectorized_batch(
-        self, configs: torch.Tensor, max_memory_mb: float = 2048.0,
+        self,
+        configs: torch.Tensor,
+        max_memory_mb: float = 2048.0,
+        max_output_mb: float = 8192.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         GPU-accelerated batch computation of Hamiltonian connections.
 
         Processes configurations in parallel using tensor operations.
         Auto-chunks to stay within ``max_memory_mb`` for intermediate tensors.
-        This is 10-50x faster than sequential get_connections() calls for large batches.
+        Limits accumulated output to ``max_output_mb`` to prevent OOM.
 
         Args:
             configs: (n_configs, num_sites) basis configurations on GPU
             max_memory_mb: memory budget for intermediate tensors (default 2048 MB)
+            max_output_mb: memory budget for accumulated output (default 8192 MB).
+                Raises MemoryError if exceeded.
 
         Returns:
             all_connected: (total_connections, num_sites) connected configurations
             all_elements: (total_connections,) matrix elements H[i,j]
             batch_indices: (total_connections,) index of source config for each connection
+
+        Raises:
+            MemoryError: if accumulated output exceeds max_output_mb
         """
         n_configs = configs.shape[0]
 
@@ -1224,19 +1266,41 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Chunk processing to stay within memory budget
         all_connected, all_elements, all_batch_idx = [], [], []
+        # Track accumulated output bytes to prevent unbounded growth
+        accumulated_bytes = 0
+        max_output_bytes = int(max_output_mb * 1e6)
+        num_sites = self.num_sites
+
         for start in range(0, n_configs, max_chunk):
             end = min(start + max_chunk, n_configs)
             chunk = configs[start:end]
             c, e, b = self._get_connections_vectorized_batch_impl(chunk)
             if len(c) > 0:
-                # Adjust batch indices to global config indices
+                # Per connection: config (num_sites * 8) + element (8) + batch_idx (8)
+                chunk_bytes = len(c) * (num_sites * 8 + 16)
+                accumulated_bytes += chunk_bytes
+
+                if accumulated_bytes > max_output_bytes:
+                    # Free accumulated data before raising
+                    del all_connected, all_elements, all_batch_idx, c, e, b
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    raise MemoryError(
+                        f"get_connections_vectorized_batch output would exceed "
+                        f"max_output_mb={max_output_mb:.0f} MB "
+                        f"(accumulated {accumulated_bytes / 1e6:.0f} MB after "
+                        f"{end}/{n_configs} configs). "
+                        f"Config space too large for in-memory connection enumeration."
+                    )
+
                 all_connected.append(c)
                 all_elements.append(e)
                 all_batch_idx.append(b + start)
 
         if not all_connected:
             device = self.device
-            num_sites = self.num_sites
             return (
                 torch.empty(0, num_sites, device=device),
                 torch.empty(0, device=device),
@@ -1722,12 +1786,22 @@ class MolecularHamiltonian(Hamiltonian):
         Returns:
             (row_indices, col_indices, values) for sparse matrix
         """
+        import gc
+
         device = self.device
         configs = configs.to(device)
         n_configs = configs.shape[0]
 
         # Use vectorized batch method (GPU-accelerated)
-        all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
+        try:
+            all_connected, all_elements, batch_indices = (
+                self.get_connections_vectorized_batch(configs)
+            )
+        except MemoryError:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
 
         if len(all_connected) == 0:
             return (
@@ -2003,7 +2077,7 @@ class MolecularHamiltonian(Hamiltonian):
         # For larger systems, return None for eigenvector
         return fci_energy_val, None
 
-    def fci_energy(self, use_cache: bool = True) -> float:
+    def fci_energy(self, use_cache: bool = True) -> Optional[float]:
         """
         Compute FCI (Full Configuration Interaction) energy.
 
@@ -2014,12 +2088,16 @@ class MolecularHamiltonian(Hamiltonian):
         IMPORTANT: Uses the same matrix_elements() function as the pipeline
         to ensure consistency between FCI reference and pipeline energy.
 
+        Returns None if the config space exceeds MAX_FCI_CONFIGS (prevents OOM).
+
         Args:
             use_cache: If True, check/store FCI energy in disk cache.
 
         Returns:
-            FCI ground state energy in Hartree
+            FCI ground state energy in Hartree, or None if too large
         """
+        import gc
+
         # Import cache module once
         _cache_mod = None
         _has_cache_meta = (
@@ -2048,10 +2126,25 @@ class MolecularHamiltonian(Hamiltonian):
 
         import time
         from itertools import combinations
+        from math import comb
 
         n_orb = self.n_orbitals
         n_alpha = self.n_alpha
         n_beta = self.n_beta
+
+        # Pre-flight size check: estimate config count BEFORE generating them.
+        # CAS(10,15) = C(15,5)^2 = 9,018,009 — would consume 8+ TB in connections.
+        n_configs_est = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
+        if n_configs_est > self.MAX_FCI_CONFIGS:
+            conn_per_config = self.estimate_connections_per_config()
+            bytes_per_conn = self.num_sites * 8 + 16
+            mem_est_gb = n_configs_est * conn_per_config * bytes_per_conn / 1e9
+            print(
+                f"FCI computation skipped: {n_configs_est:,} configs exceeds "
+                f"MAX_FCI_CONFIGS={self.MAX_FCI_CONFIGS:,}. "
+                f"Estimated memory: {mem_est_gb:.0f} GB"
+            )
+            return None
 
         # Generate all valid determinants
         alpha_configs = list(combinations(range(n_orb), n_alpha))
@@ -2084,61 +2177,87 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Stack configs into tensor
         basis_tensor = torch.stack(basis_configs).to(self.device)
+        # Free the Python list of tensors immediately
+        del basis_configs
 
         # Memory-safe path selection:
         # Dense n×n matrix = n² × 8 bytes (float64).
         # Threshold 5000: 5000² × 8 = 200 MB (safe).
-        # Above that: use direct sparse construction → O(nnz) ≈ O(200n) memory.
+        # Above that: use direct sparse construction.
         SPARSE_FCI_THRESHOLD = 5000
 
-        if n_configs > SPARSE_FCI_THRESHOLD:
-            # Sparse path: build CSR directly from get_sparse_matrix_elements()
-            # For CAS(10,10) 63504 configs: ~150 MB instead of ~97 GB
-            from scipy.sparse import coo_matrix, diags
-            from scipy.sparse.linalg import eigsh
-
-            print(f"  Using direct sparse construction ({n_configs} > {SPARSE_FCI_THRESHOLD})")
-            mem_dense_gb = n_configs ** 2 * 8 / 1e9
-            mem_sparse_est_mb = n_configs * 200 * 12 / 1e6  # ~200 nnz/row, 12 bytes each
-            print(f"  Memory: sparse ~{mem_sparse_est_mb:.0f} MB vs dense ~{mem_dense_gb:.1f} GB")
-
-            rows, cols, vals = self.get_sparse_matrix_elements(basis_tensor)
-            rows_np = rows.cpu().numpy()
-            cols_np = cols.cpu().numpy()
-            vals_np = vals.cpu().numpy().astype(np.float64)
-
-            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_configs, n_configs))
-            diag_np = self.diagonal_elements_batch(basis_tensor).cpu().numpy().astype(np.float64)
-            H_csr = H_coo.tocsr()
-            H_csr = 0.5 * (H_csr + H_csr.T)
-            H_csr = H_csr + diags(diag_np, 0, shape=(n_configs, n_configs), format='csr')
-
-            eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-12)
-            fci_E = float(eigenvalues[0])
-        else:
-            # Dense path for small systems — exact and fast
-            H_fci = self.matrix_elements(basis_tensor, basis_tensor)
-
-            # Convert to numpy with float64 for numerical stability
-            H_np = H_fci.cpu().numpy().astype(np.float64)
-
-            # Ensure Hermitian symmetry (critical for correct eigenvalues)
-            H_np = 0.5 * (H_np + H_np.T)
-
-            # Verify Hermiticity
-            asymmetry = np.abs(H_np - H_np.T).max()
-            if asymmetry > 1e-10:
-                print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
-
-            if n_configs <= 2000:
-                eigenvalues, _ = np.linalg.eigh(H_np)
-                fci_E = float(eigenvalues[0])
-            else:
-                from scipy.sparse import csr_matrix
+        try:
+            if n_configs > SPARSE_FCI_THRESHOLD:
+                from scipy.sparse import coo_matrix, diags
                 from scipy.sparse.linalg import eigsh
-                H_sparse = csr_matrix(H_np)
-                eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
+
+                print(f"  Using direct sparse construction ({n_configs} > {SPARSE_FCI_THRESHOLD})")
+                conn_per_config = self.estimate_connections_per_config()
+                bytes_per_conn = self.num_sites * 8 + 16  # config + element + batch_idx
+                mem_sparse_est_mb = n_configs * conn_per_config * bytes_per_conn / 1e6
+                mem_dense_gb = n_configs ** 2 * 8 / 1e9
+                print(
+                    f"  Memory: sparse ~{mem_sparse_est_mb:.0f} MB "
+                    f"(~{conn_per_config} conn/config) vs dense ~{mem_dense_gb:.1f} GB"
+                )
+
+                rows, cols, vals = self.get_sparse_matrix_elements(basis_tensor)
+                rows_np = rows.cpu().numpy()
+                cols_np = cols.cpu().numpy()
+                vals_np = vals.cpu().numpy().astype(np.float64)
+                # Free GPU tensors
+                del rows, cols, vals
+
+                H_coo = coo_matrix(
+                    (vals_np, (rows_np, cols_np)), shape=(n_configs, n_configs)
+                )
+                del rows_np, cols_np, vals_np
+
+                diag_np = (
+                    self.diagonal_elements_batch(basis_tensor)
+                    .cpu().numpy().astype(np.float64)
+                )
+                H_csr = H_coo.tocsr()
+                del H_coo
+                H_csr = 0.5 * (H_csr + H_csr.T)
+                H_csr = H_csr + diags(
+                    diag_np, 0, shape=(n_configs, n_configs), format='csr'
+                )
+                del diag_np
+
+                eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-12)
                 fci_E = float(eigenvalues[0])
+                del H_csr
+            else:
+                # Dense path for small systems — exact and fast
+                H_fci = self.matrix_elements(basis_tensor, basis_tensor)
+                H_np = H_fci.cpu().numpy().astype(np.float64)
+                del H_fci
+
+                H_np = 0.5 * (H_np + H_np.T)
+
+                asymmetry = np.abs(H_np - H_np.T).max()
+                if asymmetry > 1e-10:
+                    print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
+
+                if n_configs <= 2000:
+                    eigenvalues, _ = np.linalg.eigh(H_np)
+                    fci_E = float(eigenvalues[0])
+                else:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.linalg import eigsh
+                    H_sparse = csr_matrix(H_np)
+                    eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
+                    fci_E = float(eigenvalues[0])
+                del H_np
+        finally:
+            # CRITICAL on UMA (DGX Spark): CUDA cached memory IS system RAM.
+            # Without this, a failed FCI attempt leaves 80-100 GB cached by
+            # PyTorch's allocator, starving subsequent pipeline stages.
+            del basis_tensor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         elapsed = time.time() - start_time
         print(f"FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")

@@ -86,6 +86,24 @@ class SKQDConfig:
     # are used for diagonalization. Set to 0 to disable (no cap).
     max_diag_basis_size: int = 15000
 
+    # === TABOO LIST (P1.3) ===
+    # Skip configs that were previously discovered but pruned/trimmed,
+    # avoiding redundant Krylov expansion work. Inspired by CIGS (JCTC 2025).
+    use_taboo_list: bool = True
+
+    # Maximum number of hashed configs to keep in the taboo set.
+    # When exceeded, oldest entries are discarded (FIFO via deque).
+    taboo_max_size: int = 500000
+
+    # === H-COUPLING RANKING (P1.1) ===
+    # Rank discovered configs by Hamiltonian coupling strength to reference
+    # states (high-|ψ|² configs). Inspired by HAAR-SCI (JCTC Dec 2025).
+    # coupling_score(x) = Σ_i |c_i| × |⟨x|H|x_i⟩| for top reference configs.
+    use_h_coupling_ranking: bool = True
+
+    # Number of highest-amplitude basis states used as references for scoring.
+    h_coupling_n_ref: int = 50
+
     # === ADAPTIVE CONVERGENCE (PR-A2) ===
     # Energy convergence threshold (Hartree). If |E_k - E_{k-1}| < threshold,
     # early-stop the Krylov expansion. Set to 0 to disable early stopping.
@@ -1178,6 +1196,112 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         self.nf_basis = nf_basis  # (n_nf, num_sites)
 
+        # Taboo set: tracks configs that were discovered but pruned/trimmed,
+        # so we don't waste Krylov expansion rediscovering them.
+        # Uses a deque for FIFO eviction when exceeding max size.
+        from collections import deque
+        self._taboo_set: set = set()
+        self._taboo_deque: deque = deque()
+
+    def _add_to_taboo(self, hashes):
+        """Add config hashes to the taboo set with FIFO eviction."""
+        if not self.config.use_taboo_list:
+            return
+        max_size = self.config.taboo_max_size
+        for h in hashes:
+            if h not in self._taboo_set:
+                self._taboo_set.add(h)
+                self._taboo_deque.append(h)
+                # Evict oldest if over capacity
+                if len(self._taboo_set) > max_size:
+                    evicted = self._taboo_deque.popleft()
+                    self._taboo_set.discard(evicted)
+
+    def clear_taboo(self):
+        """Clear the taboo set (e.g., between independent runs)."""
+        self._taboo_set.clear()
+        self._taboo_deque.clear()
+
+    def _compute_h_coupling_scores(
+        self,
+        candidates: torch.Tensor,
+        basis: torch.Tensor,
+        psi: Optional[np.ndarray] = None,
+    ) -> torch.Tensor:
+        """
+        Compute H-coupling scores for candidate configs against reference basis.
+
+        For each candidate x, the score is:
+            score(x) = Σ_i |c_i| × |⟨x|H|x_i⟩|
+
+        where x_i are the top-|c_i| reference configs from the current basis,
+        weighted by their wavefunction amplitudes |c_i|.
+
+        This is inspired by HAAR-SCI (JCTC Dec 2025) which uses H-coupling
+        filtering to select the most physically relevant configurations.
+
+        Args:
+            candidates: (n_cand, n_sites) tensor of candidate configs
+            basis: (n_basis, n_sites) tensor of current basis configs
+            psi: Optional wavefunction coefficients for importance weighting.
+                 If None, uses uniform weights for reference selection.
+
+        Returns:
+            (n_cand,) tensor of coupling scores (higher = more important)
+        """
+        n_cand = len(candidates)
+        n_ref = min(self.config.h_coupling_n_ref, len(basis))
+
+        if n_ref == 0 or n_cand == 0:
+            return torch.zeros(n_cand)
+
+        # Select top reference configs by |ψ|² amplitude
+        if psi is not None and len(psi) >= len(basis):
+            amplitudes = np.abs(psi[:len(basis)])
+            ref_indices = np.argsort(amplitudes)[-n_ref:]
+            weights = torch.from_numpy(amplitudes[ref_indices]).float()
+        elif psi is not None:
+            amplitudes = np.abs(psi)
+            n_use = min(len(amplitudes), len(basis))
+            ref_indices = np.argsort(amplitudes[:n_use])[-n_ref:]
+            weights = torch.from_numpy(amplitudes[ref_indices]).float()
+        else:
+            ref_indices = np.arange(min(n_ref, len(basis)))
+            weights = torch.ones(len(ref_indices))
+
+        ref_configs = basis[ref_indices]  # (n_ref, n_sites)
+
+        # Compute coupling: for each candidate, sum |⟨x|H|x_i⟩| × |c_i|
+        scores = torch.zeros(n_cand)
+
+        # Pre-compute candidate hashes ONCE (hoisted from inner loop — H1.1 fix)
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
+
+        cand_hashes = config_integer_hash(candidates)
+        cand_hash_to_idx = {}
+        for idx, h in enumerate(cand_hashes):
+            if h not in cand_hash_to_idx:
+                cand_hash_to_idx[h] = idx
+
+        for j, ref in enumerate(ref_configs):
+            # Get connections from this reference config
+            connected, matrix_elements = self.hamiltonian.get_connections(ref)
+            if len(connected) == 0:
+                continue
+
+            conn_hashes = config_integer_hash(connected)
+            w_j = weights[j].item()
+
+            for k, ch in enumerate(conn_hashes):
+                if ch in cand_hash_to_idx:
+                    cand_idx = cand_hash_to_idx[ch]
+                    scores[cand_idx] += w_j * abs(matrix_elements[k].item())
+
+        return scores
+
     def _nnci_expand_basis(
         self,
         basis: torch.Tensor,
@@ -1376,8 +1500,13 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 if max_expansion > 0 and len(new_configs) > 0:
                     room = max_expansion - len(current_basis)
                     if room <= 0:
+                        # All new configs trimmed — add to taboo
+                        self._add_to_taboo(config_integer_hash(new_configs))
                         new_configs = new_configs[:0]  # Empty tensor
                     elif len(new_configs) > room:
+                        # Trimmed portion goes to taboo
+                        trimmed = new_configs[room:]
+                        self._add_to_taboo(config_integer_hash(trimmed))
                         new_configs = new_configs[:room]
 
                 if len(new_configs) > 0:
@@ -1492,11 +1621,12 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             if len(chunk_connected) == 0:
                 continue
 
-            # Dedup this chunk against basis_set and already-found new configs
+            # Dedup this chunk against basis_set, already-found, and taboo configs
             chunk_ints = config_integer_hash(chunk_connected)
+            taboo = self._taboo_set if (hasattr(self, '_taboo_set') and self.config.use_taboo_list) else set()
             chunk_new_indices = []
             for i, h in enumerate(chunk_ints):
-                if h not in basis_set and h not in new_set:
+                if h not in basis_set and h not in new_set and h not in taboo:
                     new_set.add(h)
                     chunk_new_indices.append(i)
 
@@ -1508,8 +1638,24 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         new_configs = torch.cat(new_config_chunks, dim=0)
 
-        # If MP2 t2 amplitudes are cached, rank by importance instead of arbitrary order
-        if len(new_configs) > max_new_per_step and hasattr(self, '_mp2_t2') and self._mp2_t2 is not None:
+        if len(new_configs) <= max_new_per_step:
+            return new_configs
+
+        # === RANKING: select top configs when we have more than max_new_per_step ===
+
+        # P1.1: H-coupling ranking (priority over MP2 when wavefunction available)
+        if (self.config.use_h_coupling_ranking
+                and hasattr(self, '_nf_guided_psi')
+                and self._nf_guided_psi is not None):
+            scores = self._compute_h_coupling_scores(
+                new_configs, basis, psi=self._nf_guided_psi
+            )
+            if scores.sum() > 0:  # Only use if we got meaningful scores
+                _, top_indices = torch.topk(scores, min(max_new_per_step, len(scores)))
+                return new_configs[top_indices]
+
+        # Fallback: MP2 ranking if t2 amplitudes are cached
+        if hasattr(self, '_mp2_t2') and self._mp2_t2 is not None:
             try:
                 from utils.perturbative_pruning import mp2_importance_scores, _classify_excitation
             except ImportError:
@@ -1782,6 +1928,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             Dictionary with results comparing NF-only, Krylov-only, and combined.
             Includes energy_history, effective_dt, converged, ill_conditioned_stop.
         """
+        # Clear taboo set from any previous run to avoid stale exclusions.
+        self.clear_taboo()
+
         if max_krylov_dim is None:
             max_krylov_dim = self.config.max_krylov_dim
 

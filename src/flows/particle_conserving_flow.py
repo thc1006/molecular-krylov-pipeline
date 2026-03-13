@@ -35,9 +35,27 @@ class GumbelTopK(nn.Module):
     Backward pass: soft gradients via Gumbel-Softmax
     """
 
-    def __init__(self, temperature: float = 1.0):
+    def __init__(self, temperature: float = 1.0, min_temperature: float = 0.1):
         super().__init__()
-        self.temperature = temperature
+        self.min_temperature = min_temperature
+        # Store as nn.Parameter for API consistency with SigmoidTopK.
+        # Gumbel temperature is typically controlled by external annealing,
+        # but making it a Parameter keeps the interface uniform.
+        self.log_temperature = nn.Parameter(
+            torch.tensor(math.log(math.expm1(max(temperature - min_temperature, 1e-6))))
+        )
+
+    @property
+    def temperature(self):
+        """Effective temperature: min_temperature + softplus(log_temperature)."""
+        return self.min_temperature + F.softplus(self.log_temperature)
+
+    @temperature.setter
+    def temperature(self, value):
+        """Allow external temperature setting (e.g., annealing schedule)."""
+        with torch.no_grad():
+            target = max(value - self.min_temperature, 1e-6)
+            self.log_temperature.copy_(torch.tensor(math.log(math.expm1(target))))
 
     def forward(
         self,
@@ -305,12 +323,14 @@ class ParticleConservingFlow(nn.Module):
         n_beta: int,
         hidden_dims: list = None,
         temperature: float = 1.0,
+        topk_type: str = "sigmoid",
     ):
         super().__init__()
         self.n_orbitals = n_orbitals
         self.n_alpha = n_alpha
         self.n_beta = n_beta
         self.n_qubits = 2 * n_orbitals
+        self._topk_type = topk_type
 
         # Auto-scale hidden dims by system size (depth > width, per FermiNet/Psiformer)
         if hidden_dims is None:
@@ -344,22 +364,33 @@ class ParticleConservingFlow(nn.Module):
         beta_layers.append(nn.Linear(in_dim, n_orbitals))
         self.beta_conditioned_scorer = nn.Sequential(*beta_layers)
 
-        # SigmoidTopK: deterministic, gradient-exact top-k via implicit differentiation.
-        # Replaces GumbelTopK which has vanishing gradients at non-selected positions.
-        self.topk_selector = SigmoidTopK(temperature)
+        # Top-k selector: "sigmoid" (deterministic, exact gradients) or
+        # "gumbel" (stochastic, better exploration at high temperature).
+        if topk_type not in ("sigmoid", "gumbel"):
+            raise ValueError(f"Unknown topk_type '{topk_type}'. Use 'sigmoid' or 'gumbel'.")
+        if topk_type == "gumbel":
+            self.topk_selector = GumbelTopK(temperature)
+        else:
+            self.topk_selector = SigmoidTopK(temperature)
 
     @property
     def temperature(self):
-        """Delegate to topk_selector's learnable temperature."""
+        """Delegate to topk_selector's temperature."""
         return self.topk_selector.temperature
 
     @temperature.setter
     def temperature(self, value):
-        self.topk_selector.temperature = value
+        if isinstance(self.topk_selector, SigmoidTopK):
+            self.topk_selector.temperature = value
+        else:
+            self.topk_selector.temperature = value
 
     def set_temperature(self, temperature: float):
         """Update temperature for top-k sampling."""
-        self.topk_selector.temperature = temperature
+        if isinstance(self.topk_selector, SigmoidTopK):
+            self.topk_selector.temperature = temperature
+        else:
+            self.topk_selector.temperature = temperature
 
     def sample(
         self,
@@ -595,6 +626,7 @@ class ParticleConservingFlowSampler(nn.Module):
         num_coupling_layers: int = 4,  # Ignored, kept for API compatibility
         hidden_dims: list = None,
         temperature: float = 1.0,
+        topk_type: str = "sigmoid",
     ):
         super().__init__()
 
@@ -611,6 +643,7 @@ class ParticleConservingFlowSampler(nn.Module):
             n_beta=n_beta,
             hidden_dims=hidden_dims,
             temperature=temperature,
+            topk_type=topk_type,
         )
 
     def sample(

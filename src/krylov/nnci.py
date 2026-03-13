@@ -96,6 +96,13 @@ class NNCIConfig:
     max_candidates: int = 0
     convergence_threshold: float = 1e-6
     seed: int = 42
+    # Natural orbital (NO) prioritization for candidate generation (P2.2).
+    # When True, prioritizes excitations involving correlated orbitals
+    # (NO occupation numbers far from 0 or 2). Requires closed-shell system.
+    use_natural_orbitals: bool = False
+    # Maximum number of orbitals to consider for excitations (most correlated first).
+    # 0 = use all orbitals (no truncation). Useful for large active spaces.
+    no_max_active_orbitals: int = 0
 
 
 class ConfigImportanceClassifier(nn.Module):
@@ -365,6 +372,11 @@ class NNCIActiveLearning:
         # Reference state for excitation generation
         self.hf_state = hamiltonian.get_hf_state()
 
+        # Natural orbital prioritization (P2.2)
+        self._no_active_orbitals = None
+        if self.config.use_natural_orbitals:
+            self._setup_natural_orbitals()
+
     def run(self) -> Dict[str, Any]:
         """Run the active learning loop.
 
@@ -510,11 +522,48 @@ class NNCIActiveLearning:
         clf.eval()
         return clf
 
+    def _setup_natural_orbitals(self):
+        """Compute natural orbitals and identify active correlated orbitals."""
+        try:
+            try:
+                from utils.perturbative_pruning import (
+                    compute_natural_orbitals, no_orbital_importance,
+                )
+            except ImportError:
+                from ..utils.perturbative_pruning import (
+                    compute_natural_orbitals, no_orbital_importance,
+                )
+
+            occ_numbers, no_coeffs = compute_natural_orbitals(self.hamiltonian)
+            importance = no_orbital_importance(occ_numbers)
+
+            # Select active orbitals by importance
+            n_orb = self.n_orbitals
+            max_active = self.config.no_max_active_orbitals
+            if max_active > 0 and max_active < n_orb:
+                active_idx = np.argsort(importance)[::-1][:max_active]
+                active_idx = np.sort(active_idx)  # Keep original orbital ordering
+            else:
+                active_idx = np.arange(n_orb)
+
+            self._no_active_orbitals = active_idx.tolist()
+            self._no_occ_numbers = occ_numbers
+            self._no_coeffs = no_coeffs
+            self._no_importance = importance
+        except (ValueError, RuntimeError) as e:
+            # MP2 may fail for open-shell or CASSCF orbitals
+            import warnings
+            warnings.warn(f"Natural orbital computation failed: {e}. Using all orbitals.")
+            self._no_active_orbitals = None
+
     def _generate_candidates(self) -> torch.Tensor:
         """Generate candidate configs beyond the current basis.
 
         Generates excitations from the HF reference at ranks 3+
         (triples, quadruples, etc.), excluding configs already in the basis.
+
+        When natural orbital prioritization is active, restricts excitations
+        to the most correlated orbitals for more compact candidate generation.
 
         Returns
         -------
@@ -524,16 +573,100 @@ class NNCIActiveLearning:
         cfg = self.config
         max_cands = cfg.max_candidates if cfg.max_candidates > 0 else 0
 
-        # Generate candidates from HF reference
-        candidates = self.generator.generate_excitations(
-            self.hf_state,
-            max_rank=cfg.max_excitation_rank,
-            min_rank=1,  # Include all ranks; exclude handles overlap
-            exclude=self.basis,
-            max_candidates=max_cands,
-        )
+        if self._no_active_orbitals is not None:
+            # NO-prioritized: generate excitations restricted to active orbitals
+            candidates = self._generate_no_candidates(max_cands)
+        else:
+            # Standard: generate all excitations
+            candidates = self.generator.generate_excitations(
+                self.hf_state,
+                max_rank=cfg.max_excitation_rank,
+                min_rank=1,
+                exclude=self.basis,
+                max_candidates=max_cands,
+            )
 
         return candidates
+
+    def _generate_no_candidates(self, max_candidates: int) -> torch.Tensor:
+        """Generate candidates restricted to NO-prioritized active orbitals.
+
+        Only generates excitations from/to orbitals in the active set,
+        which are ranked by correlation importance from NO occupation numbers.
+        """
+        n_orb = self.n_orbitals
+        ref_np = self.hf_state.cpu().numpy()
+        active = set(self._no_active_orbitals)
+
+        # Active occupied/virtual orbitals
+        occ_alpha = [i for i in range(n_orb) if ref_np[i] == 1 and i in active]
+        virt_alpha = [i for i in range(n_orb) if ref_np[i] == 0 and i in active]
+        occ_beta = [i for i in range(n_orb) if ref_np[i + n_orb] == 1 and i in active]
+        virt_beta = [i for i in range(n_orb) if ref_np[i + n_orb] == 0 and i in active]
+
+        candidates = []
+        cfg = self.config
+
+        for rank in range(1, cfg.max_excitation_rank + 1):
+            for n_a_exc in range(rank + 1):
+                n_b_exc = rank - n_a_exc
+                if n_a_exc > min(len(occ_alpha), len(virt_alpha)):
+                    continue
+                if n_b_exc > min(len(occ_beta), len(virt_beta)):
+                    continue
+
+                if n_a_exc == 0:
+                    alpha_excitations = [([], [])]
+                else:
+                    alpha_excitations = [
+                        (list(holes), list(particles))
+                        for holes in combinations(occ_alpha, n_a_exc)
+                        for particles in combinations(virt_alpha, n_a_exc)
+                    ]
+
+                if n_b_exc == 0:
+                    beta_excitations = [([], [])]
+                else:
+                    beta_excitations = [
+                        (list(holes), list(particles))
+                        for holes in combinations(occ_beta, n_b_exc)
+                        for particles in combinations(virt_beta, n_b_exc)
+                    ]
+
+                for a_holes, a_parts in alpha_excitations:
+                    for b_holes, b_parts in beta_excitations:
+                        new_config = ref_np.copy()
+                        for h in a_holes:
+                            new_config[h] = 0
+                        for p in a_parts:
+                            new_config[p] = 1
+                        for h in b_holes:
+                            new_config[h + n_orb] = 0
+                        for p in b_parts:
+                            new_config[p + n_orb] = 1
+                        candidates.append(new_config)
+
+                        if max_candidates > 0 and len(candidates) > max_candidates * 5:
+                            break
+                    if max_candidates > 0 and len(candidates) > max_candidates * 5:
+                        break
+                if max_candidates > 0 and len(candidates) > max_candidates * 5:
+                    break
+
+        if not candidates:
+            return torch.empty(0, self.n_sites, dtype=torch.long)
+
+        result = torch.from_numpy(np.array(candidates)).long()
+        result = torch.unique(result, dim=0)
+
+        # Exclude existing basis
+        if len(self.basis) > 0 and len(result) > 0:
+            result = self.generator._exclude_configs(result, self.basis)
+
+        if max_candidates > 0 and len(result) > max_candidates:
+            result = result[:max_candidates]
+
+        return result
 
     @torch.no_grad()
     def _score_candidates(

@@ -834,6 +834,79 @@ class AutoregressiveFlowSampler(nn.Module):
         unique_configs = torch.unique(configs.long(), dim=0)
         return log_probs, unique_configs
 
+    def sample_unique(
+        self,
+        n_unique_target: int,
+        max_attempts: int = 10,
+        batch_multiplier: float = 2.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample configurations with rejection of duplicates (P2.4).
+
+        Repeatedly samples batches and accumulates unique configurations until
+        reaching the target count or exhausting attempts. This avoids the waste
+        of standard sampling when the distribution is peaked (many duplicates).
+
+        Parameters
+        ----------
+        n_unique_target : int
+            Desired number of unique configurations.
+        max_attempts : int
+            Maximum number of sampling rounds before giving up.
+        batch_multiplier : float
+            Sample ``n_unique_remaining * batch_multiplier`` per round.
+
+        Returns
+        -------
+        log_probs : torch.Tensor
+            (n_unique,) log probabilities of unique configs (via teacher forcing).
+        unique_configs : torch.Tensor
+            (n_unique, num_sites) unique binary configurations.
+        """
+        all_configs = []
+        seen_hashes: set = set()
+
+        for attempt in range(max_attempts):
+            n_remaining = n_unique_target - len(all_configs)
+            if n_remaining <= 0:
+                break
+
+            # Sample a batch (over-sample to account for duplicates)
+            n_batch = max(int(n_remaining * batch_multiplier), n_remaining)
+            states, _ = self._sample_autoregressive(n_batch)
+            configs = states_to_configs(states, self.n_orbitals).long()
+
+            # Batch-hash on CPU for efficient dedup (avoids per-config GPU→CPU transfer)
+            configs_cpu = configs.cpu()
+            try:
+                try:
+                    from utils.config_hash import config_integer_hash
+                except ImportError:
+                    from ..utils.config_hash import config_integer_hash
+                hashes = config_integer_hash(configs_cpu)
+            except Exception:
+                # Fallback: tuple-based hashing
+                hashes = [tuple(configs_cpu[i].tolist()) for i in range(len(configs_cpu))]
+
+            for i, h in enumerate(hashes):
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    all_configs.append(configs_cpu[i])
+                    if len(all_configs) >= n_unique_target:
+                        break
+
+        if not all_configs:
+            # Fallback: return whatever sample() gives
+            return self.sample(n_unique_target)
+
+        unique_configs = torch.stack(all_configs, dim=0)
+
+        # Recompute exact log probs via teacher forcing (more accurate than
+        # accumulated sampling log probs which may be stale for duplicates)
+        with torch.no_grad():
+            log_probs = self.log_prob(unique_configs.to(next(self.parameters()).device))
+
+        return log_probs, unique_configs
+
     def sample_with_probs(self, n_samples: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample and return all configs with their log probabilities.
 

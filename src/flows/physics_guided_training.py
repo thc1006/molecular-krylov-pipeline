@@ -125,6 +125,14 @@ class PhysicsGuidedConfig:
     # Set to 1.0 to use all connections, 0.1 to use 10%
     stochastic_connections_fraction: float = 1.0
 
+    # === H-COUPLING GUIDED TRAINING (HAAR-SCI inspired) ===
+    # When > 0 and set_eigenstate_reference() has been called, adds a reward term
+    # for configs with strong Hamiltonian coupling to the current eigenstate.
+    # This guides NF beyond pure cross-entropy matching toward physically important
+    # configurations (triples, quadruples coupled to the ground state).
+    h_coupling_weight: float = 0.0  # Default off for backward compat
+    h_coupling_n_ref: int = 50  # Number of top reference configs for coupling
+
     # === PAPER-ALIGNED ENERGY COMPUTATION ===
     # Use subspace diagonalization for energy (paper's method) instead of local energy
     # Paper Section 3.2-3.3: "Energy is computed by diagonalizing H restricted to S"
@@ -231,6 +239,7 @@ class PhysicsGuidedFlowTrainer:
             'unique_ratios': [],
             'basis_sizes': [],
             'cache_hit_rates': [],
+            'coupling_losses': [],
         }
 
         # Early stopping tracking
@@ -241,6 +250,11 @@ class PhysicsGuidedFlowTrainer:
         self._essential_configs = None
         if config.inject_essential_configs and hasattr(hamiltonian, 'n_alpha'):
             self._essential_configs = self._generate_essential_configs()
+
+        # H-coupling eigenstate reference (set by pipeline during iterative refinement)
+        self._eigenstate_basis = None
+        self._eigenstate_coeffs = None
+        self._h_coupling_table = {}  # hash -> coupling score
 
     def _generate_essential_configs(self) -> torch.Tensor:
         """
@@ -382,6 +396,91 @@ class PhysicsGuidedFlowTrainer:
               f"1 HF + {n_singles} singles + {n_doubles} doubles")
 
         return essential_tensor
+
+    def set_eigenstate_reference(
+        self,
+        basis: torch.Tensor,
+        coefficients: np.ndarray,
+    ):
+        """
+        Set eigenstate reference for H-coupling guided training.
+
+        Called by pipeline during iterative refinement to provide the eigenstate
+        from the previous SKQD diag as guidance for NF. Pre-computes a coupling
+        lookup table: for each config reachable by single/double excitation from
+        the top reference configs, store its accumulated coupling score.
+
+        score(x) = Σ_i |c_i| × |⟨x|H|x_i⟩|
+
+        Args:
+            basis: (n_basis, n_sites) tensor of basis configs
+            coefficients: (n_basis,) array of eigenstate coefficients
+        """
+        try:
+            from ..utils.config_hash import config_integer_hash
+        except ImportError:
+            from utils.config_hash import config_integer_hash
+
+        self._eigenstate_basis = basis
+        self._eigenstate_coeffs = coefficients
+        self._h_coupling_table = {}
+
+        n_ref = min(self.config.h_coupling_n_ref, len(basis))
+        amplitudes = np.abs(coefficients[:len(basis)])
+        ref_indices = np.argsort(amplitudes)[-n_ref:]
+
+        for j in ref_indices:
+            ref = basis[j]
+            w_j = float(abs(coefficients[j]))
+            if w_j < 1e-10:
+                continue
+
+            # Use connection cache if available, otherwise direct computation
+            if self.connection_cache is not None:
+                connected, elements = self.connection_cache.get_or_compute(
+                    ref, self.hamiltonian
+                )
+            else:
+                connected, elements = self.hamiltonian.get_connections(ref)
+
+            if len(connected) == 0:
+                continue
+
+            conn_hashes = config_integer_hash(connected)
+            for k, ch in enumerate(conn_hashes):
+                score = w_j * abs(float(elements[k]))
+                if ch in self._h_coupling_table:
+                    self._h_coupling_table[ch] += score
+                else:
+                    self._h_coupling_table[ch] = score
+
+        print(f"H-coupling table: {len(self._h_coupling_table)} entries "
+              f"from {n_ref} reference configs")
+
+    def _compute_h_coupling_scores(self, configs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute H-coupling scores for sampled configs using pre-built lookup.
+
+        Args:
+            configs: (n, n_sites) tensor of sampled configs
+
+        Returns:
+            (n,) tensor of coupling scores (0 if config has no coupling)
+        """
+        if not self._h_coupling_table:
+            return torch.zeros(len(configs), device=configs.device)
+
+        try:
+            from ..utils.config_hash import config_integer_hash
+        except ImportError:
+            from utils.config_hash import config_integer_hash
+
+        hashes = config_integer_hash(configs)
+        scores = torch.zeros(len(configs), device=configs.device)
+        for i, h in enumerate(hashes):
+            scores[i] = self._h_coupling_table.get(h, 0.0)
+
+        return scores
 
     def _warmup_cache_with_hf_neighborhood(self):
         """
@@ -538,6 +637,7 @@ class PhysicsGuidedFlowTrainer:
             self.history['physics_losses'].append(metrics['physics_loss'])
             self.history['entropy_values'].append(metrics['entropy'])
             self.history['unique_ratios'].append(metrics['unique_ratio'])
+            self.history['coupling_losses'].append(metrics['coupling_loss'])
 
             if 'accumulated_energy' in metrics:
                 self.history['accumulated_energies'].append(metrics['accumulated_energy'])
@@ -610,6 +710,7 @@ class PhysicsGuidedFlowTrainer:
             'teacher_loss': 0.0,
             'physics_loss': 0.0,
             'entropy': 0.0,
+            'coupling_loss': 0.0,
             'unique_ratio': 0.0,
         }
 
@@ -696,6 +797,7 @@ class PhysicsGuidedFlowTrainer:
             total_metrics['teacher_loss'] += loss_components['teacher'].item()
             total_metrics['physics_loss'] += loss_components['physics'].item()
             total_metrics['entropy'] += loss_components['entropy'].item()
+            total_metrics['coupling_loss'] += loss_components['coupling'].item()
             total_metrics['unique_ratio'] += unique_ratio
 
         # Average metrics
@@ -1158,10 +1260,25 @@ class PhysicsGuidedFlowTrainer:
         # Entropy is added separately, unscaled — it's a pure regularizer
         total_loss = scaled_loss - config.entropy_weight * entropy
 
+        # === H-Coupling Loss (HAAR-SCI style) ===
+        # Reward NF for sampling configs with strong Hamiltonian coupling to
+        # the current eigenstate. Scores have natural Hartree scale from
+        # |c_i| * |<x|H|x_i>|, so use independent weight without energy scaling.
+        coupling_loss = torch.zeros(1, device=flow_probs.device)
+        if config.h_coupling_weight > 0 and self._h_coupling_table:
+            coupling_scores = self._compute_h_coupling_scores(unique_configs)
+            if coupling_scores.sum() > 0:
+                # Normalize to [0, 1] for stable gradient scale
+                coupling_scores = coupling_scores / (coupling_scores.max() + 1e-10)
+                # REINFORCE: maximize expected coupling score under flow
+                coupling_loss = -(flow_probs * coupling_scores.detach()).sum()
+                total_loss = total_loss + config.h_coupling_weight * coupling_loss
+
         components = {
             'teacher': teacher_loss,
             'physics': physics_loss,
             'entropy': entropy,
+            'coupling': coupling_loss,
         }
 
         return total_loss, components

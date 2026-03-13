@@ -399,3 +399,145 @@ def prune_basis(
         # Simple top-k by score
         _, top_indices = torch.topk(scores, min(max_configs, n_configs))
         return configs[top_indices]
+
+
+# =============================================================================
+# Natural Orbitals from MP2 1-RDM (P2.2)
+# =============================================================================
+
+
+def compute_mp2_rdm1(hamiltonian) -> np.ndarray:
+    """Compute the MP2 unrelaxed one-particle density matrix in MO basis.
+
+    The MP2 1-RDM is the HF density plus the MP2 correction:
+        γ_pq = D^HF_pq + D^(2)_pq
+
+    For closed-shell (RHF):
+        D^HF_ij = 2δ_ij  (occupied block)
+        D^(2)_ij = -Σ_{kab} (2T_ikab - T_ikba)(2T_jkab - T_jkba)
+                         [using Hermitian symmetrized amplitude Tbar]
+        D^(2)_ab = +Σ_{ijc} (2T_ijac - T_ijca)(2T_ijbc - T_ijcb)
+
+    Reference: Szabo & Ostlund (1996), Chapter 6.
+
+    Args:
+        hamiltonian: MolecularHamiltonian with integrals (closed-shell only)
+
+    Returns:
+        rdm1: (n_orb, n_orb) one-particle density matrix in MO basis
+    """
+    t2, _ = compute_mp2_amplitudes(hamiltonian)
+    n_occ, _, n_vir, _ = t2.shape
+    n_orb = n_occ + n_vir
+
+    rdm1 = np.zeros((n_orb, n_orb), dtype=np.float64)
+
+    # HF contribution: occupied block = 2*I
+    for i in range(n_occ):
+        rdm1[i, i] = 2.0
+
+    # MP2 correction: occupied-occupied block
+    # D^(2)_ij = -Σ_{kab} Tbar_{ikab} * Tbar_{jkab}
+    # where Tbar_{ikab} = 2*t2_{ikab} - t2_{ikba}
+    tbar = 2.0 * t2 - t2.transpose(0, 1, 3, 2)  # (nocc, nocc, nvir, nvir)
+    # D^(2)_ij = -Σ_{kab} tbar[i,k,a,b] * tbar[j,k,a,b]
+    tbar_flat = tbar.reshape(n_occ, -1)  # (nocc, nocc*nvir*nvir)
+    d2_oo = -tbar_flat @ tbar_flat.T  # (nocc, nocc)
+    rdm1[:n_occ, :n_occ] += d2_oo
+
+    # MP2 correction: virtual-virtual block
+    # D^(2)_ab = +Σ_{ijc} tbar[i,j,a,c] * tbar[i,j,b,c]
+    # Reshape: tbar has shape (nocc, nocc, nvir, nvir)
+    # For each (a,b): sum over i,j,c of tbar[i,j,a,c]*tbar[i,j,b,c]
+    tbar_vv = tbar.reshape(n_occ * n_occ, n_vir, n_vir)  # (nocc^2, nvir, nvir)
+    # d2_vv[a,b] = Σ_{ij,c} tbar_vv[ij,a,c] * tbar_vv[ij,b,c]
+    # Flatten: for each virtual a, collapse (ij, c) dimensions
+    tbar_for_vv = tbar_vv.transpose(1, 0, 2).reshape(n_vir, -1)  # (nvir, nocc^2*nvir)
+    d2_vv = tbar_for_vv @ tbar_for_vv.T  # (nvir, nvir)
+    rdm1[n_occ:, n_occ:] += d2_vv
+
+    return rdm1
+
+
+def compute_natural_orbitals(hamiltonian) -> tuple[np.ndarray, np.ndarray]:
+    """Compute natural orbitals from MP2 1-RDM.
+
+    Natural orbitals (NOs) are eigenvectors of the 1-RDM. Their eigenvalues
+    (occupation numbers) measure orbital importance for correlation:
+    - n ≈ 2.0: doubly occupied, HF-like
+    - n ≈ 0.0: empty, negligible correlation contribution
+    - 0 << n << 2: strongly correlated, important for CI
+
+    Orbitals are returned sorted by occupation number (descending).
+
+    Args:
+        hamiltonian: MolecularHamiltonian with integrals (closed-shell only)
+
+    Returns:
+        occ_numbers: (n_orb,) natural orbital occupation numbers, descending
+        no_coeffs: (n_orb, n_orb) transformation matrix from MO to NO basis.
+                   Each column is a natural orbital in MO basis.
+    """
+    rdm1 = compute_mp2_rdm1(hamiltonian)
+    # Diagonalize: rdm1 = C @ diag(n) @ C^T
+    occ_numbers, no_coeffs = np.linalg.eigh(rdm1)
+
+    # Sort by descending occupation number (eigh returns ascending)
+    idx = np.argsort(occ_numbers)[::-1]
+    occ_numbers = occ_numbers[idx]
+    no_coeffs = no_coeffs[:, idx]
+
+    return occ_numbers, no_coeffs
+
+
+def transform_integrals_to_no_basis(
+    hamiltonian,
+    no_coeffs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Transform h1e and h2e integrals from MO basis to Natural Orbital basis.
+
+    Uses the 4-index transformation:
+        h1e_NO[p,q] = Σ_{rs} C[r,p] * h1e[r,s] * C[s,q]
+        h2e_NO[p,q,r,s] = Σ_{abcd} C[a,p] * C[b,q] * h2e[a,b,c,d] * C[c,r] * C[d,s]
+
+    Args:
+        hamiltonian: MolecularHamiltonian with integrals
+        no_coeffs: (n_orb, n_orb) MO→NO transformation matrix
+
+    Returns:
+        h1e_no: (n_orb, n_orb) one-electron integrals in NO basis
+        h2e_no: (n_orb, n_orb, n_orb, n_orb) two-electron integrals in NO basis
+    """
+    h1e = hamiltonian.integrals.h1e.astype(np.float64)
+    h2e = hamiltonian.integrals.h2e.astype(np.float64)
+    C = no_coeffs.astype(np.float64)
+
+    # 1-electron: h1e_NO = C^T @ h1e @ C
+    h1e_no = C.T @ h1e @ C
+
+    # 2-electron: 4-index transform via sequential contractions
+    # Step 1: h2e[a,b,c,d] × C[d,s] → tmp1[a,b,c,s]
+    tmp1 = np.einsum("abcd,ds->abcs", h2e, C)
+    # Step 2: tmp1[a,b,c,s] × C[c,r] → tmp2[a,b,r,s]
+    tmp2 = np.einsum("abcs,cr->abrs", tmp1, C)
+    # Step 3: tmp2[a,b,r,s] × C[b,q] → tmp3[a,q,r,s]
+    tmp3 = np.einsum("abrs,bq->aqrs", tmp2, C)
+    # Step 4: tmp3[a,q,r,s] × C[a,p] → h2e_NO[p,q,r,s]
+    h2e_no = np.einsum("aqrs,ap->pqrs", tmp3, C)
+
+    return h1e_no, h2e_no
+
+
+def no_orbital_importance(occ_numbers: np.ndarray) -> np.ndarray:
+    """Rank orbitals by correlation importance from NO occupation numbers.
+
+    Importance = min(n, 2-n), measuring deviation from fully occupied/empty.
+    Higher values = more correlated = more important for excitation generation.
+
+    Args:
+        occ_numbers: (n_orb,) natural orbital occupation numbers
+
+    Returns:
+        importance: (n_orb,) correlation importance scores
+    """
+    return np.minimum(occ_numbers, 2.0 - occ_numbers)
