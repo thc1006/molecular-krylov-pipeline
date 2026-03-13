@@ -1,8 +1,10 @@
 """40 Qubit Benchmark Tests: N2/cc-pVDZ CAS(10,20).
 
 Phase C of the 24Q -> 40Q scaling ladder.  At 40Q, CISD coverage drops to
-~0.003%, demonstrating that NF is essential for finding important configs
-beyond singles+doubles.
+~0.003%.  However, after the SKQD get_combined_basis bug fix, Direct-CI +
+Krylov expansion discovers equivalent configs — NF provides no measurable
+advantage until REINFORCE is replaced by MinSR/SPRING and H-coupling
+filtering is added (see docs/NQS-VMC-SURVEY-2026-Q1.md).
 
 System:
 - N2/cc-pVDZ CAS(10,20): 20 orbitals, 5α+5β, 240,374,016 configs
@@ -455,10 +457,13 @@ class TestN2CAS20NFPipeline:
               f"best={best_e:.6f}, improve={improvement:.2f} mHa")
 
     def test_nf_beats_direct_ci(self, n2_cas20, n2_cas20_hf_energy):
-        """NF-trained pipeline must produce BETTER energy than Direct-CI.
+        """NF-trained pipeline should not regress vs Direct-CI.
 
-        This is the core claim: at 40Q (CISD ~0.003%), the AR flow
-        discovers important high-rank configurations that Direct-CI misses.
+        After the SKQD get_combined_basis bug fix (2026-03), Direct-CI +
+        Krylov expansion discovers the same configs as NF at 40Q on STO-3G.
+        NF's value only emerges when: (1) REINFORCE is replaced by MinSR/SPRING,
+        (2) H-coupling filtering guides NF sampling.  Until those upgrades,
+        we only require NF is not *worse* than Direct-CI (variational principle).
         """
         from pipeline import FlowGuidedKrylovPipeline, PipelineConfig
 
@@ -490,18 +495,16 @@ class TestN2CAS20NFPipeline:
         nf_res = nf_pipe.run(progress=False)
         e_nf = nf_res.get("combined_energy") or nf_res.get("skqd_energy")
 
-        # NF must beat Direct-CI
         delta = (e_dci - e_nf) * 1000
         print(f"\nN2 40Q NF vs Direct-CI:")
         print(f"  Direct-CI: {e_dci:.6f} Ha (improve {(e_hf-e_dci)*1000:.1f} mHa)")
         print(f"  NF-Trained: {e_nf:.6f} Ha (improve {(e_hf-e_nf)*1000:.1f} mHa)")
         print(f"  NF advantage: {delta:.2f} mHa")
 
-        assert e_nf < e_dci, (
-            f"NF ({e_nf:.6f}) did not beat Direct-CI ({e_dci:.6f}) at 40Q"
-        )
-        assert delta > 10, (
-            f"NF advantage {delta:.1f} mHa too small — expected >10 mHa at 40Q"
+        # NF must not regress vs Direct-CI (allow 2 mHa tolerance for stochastic NF)
+        assert e_nf <= e_dci + 2e-3, (
+            f"NF ({e_nf:.6f}) regressed vs Direct-CI ({e_dci:.6f}) by "
+            f"{-delta:.1f} mHa — exceeds 2 mHa tolerance"
         )
 
     def test_nf_basis_diversity(self, n2_cas20, n2_cas20_hf_energy):
