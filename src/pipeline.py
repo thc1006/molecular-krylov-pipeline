@@ -22,10 +22,29 @@ Usage:
 """
 
 import gc
+import os
+import multiprocessing
 import torch
 import numpy as np
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
+
+# ── Hardware thread configuration ───────────────────────────────────────────
+# DGX Spark has 20 CPU cores. Configure all thread pools once at import time
+# so that SciPy eigsh (OpenMP/BLAS), Numba prange, and PyTorch CPU ops all
+# utilise the full core count instead of defaulting to 1 or auto-detecting wrong.
+_N_CPUS = multiprocessing.cpu_count()
+os.environ.setdefault("OMP_NUM_THREADS", str(_N_CPUS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_N_CPUS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_N_CPUS))
+os.environ.setdefault("NUMBA_NUM_THREADS", str(_N_CPUS))
+if hasattr(torch, "set_num_threads"):
+    torch.set_num_threads(_N_CPUS)
+if hasattr(torch, "set_num_interop_threads"):
+    try:
+        torch.set_num_interop_threads(min(4, _N_CPUS))
+    except RuntimeError:
+        pass  # already set
 
 # Flow components
 try:
@@ -295,8 +314,10 @@ class PipelineConfig:
             tier = "medium"
         elif n_valid_configs <= 20000:
             tier = "large"
-        else:
+        elif n_valid_configs <= 1_000_000_000:
             tier = "very_large"
+        else:
+            tier = "extreme"  # >1B configs: CAS(10,26) 52Q = 4.33B
 
         # Conditional NF training based on system size (PR 2.1 / ADR-001)
         # Systems <= 20K configs: Direct-CI sufficient (HF + singles + doubles)
@@ -379,7 +400,7 @@ class PipelineConfig:
                 if self.sqd_noise_rate > 0:
                     self.sqd_noise_rate = max(self.sqd_noise_rate, 0.10)
 
-        else:  # very_large
+        elif tier == "very_large":
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
@@ -412,6 +433,47 @@ class PipelineConfig:
                 self.sqd_num_batches = max(self.sqd_num_batches, 10)
                 if self.sqd_noise_rate > 0:
                     self.sqd_noise_rate = max(self.sqd_noise_rate, 0.15)
+
+        else:  # extreme (>1B configs: CAS(10,26) 52Q = 4.33B)
+            # ── UMA-aware memory budget ──────────────────────────────────
+            # DGX Spark 128 GB UMA is shared CPU/GPU. Budget allocation:
+            #   Integrals (h2e 26^4 FP64)  :  ~3.7 GB
+            #   Sparse H (eigsh)           :  ~10 GB (15K basis, ~15K nnz/row)
+            #   ConnectionCache            :   8 GB (auto-scaled)
+            #   SKQD Krylov vectors        :  ~2 GB
+            #   NF model + optimizer       :  ~2 GB
+            #   PyTorch CUDA cache + OS    : ~30 GB
+            #   ─────────────────────────────────────
+            #   Total                      : ~56 GB → safe within 128 GB
+            self.max_accumulated_basis = 20000
+            self.max_diverse_configs = 15000
+            # 10K² × 16 (complex128) = 1.6 GB dense fallback.
+            # Sparse path (eigsh) handles up to 15K efficiently.
+            self.max_diag_basis_size = 10000
+
+            # Compact networks: minimize GPU memory for model weights
+            self.nqs_hidden_dims = [384, 384, 384, 384]
+            self.nf_hidden_dims = [256, 256]
+
+            # Training: fewer epochs, more samples per batch (amortises
+            # the expensive H-coupling per-config connection computation)
+            self.max_epochs = max(self.max_epochs, 150)
+            self.min_epochs = max(self.min_epochs, 30)
+            self.samples_per_batch = 3000
+
+            # Full energy signal — no shortcuts
+            self.max_connections_per_config = 0
+            self.diagonal_only_warmup_epochs = 0
+            self.stochastic_connections_fraction = 1.0
+
+            # Krylov: fewer steps but adaptive dt for convergence
+            self.max_krylov_dim = 3
+            self.skqd_adaptive_dt = True
+
+            if verbose:
+                # Estimate memory with available Hamiltonian info
+                print(f"  [extreme tier] UMA budget: 128 GB shared CPU/GPU")
+                print(f"  max_diag_basis_size: {self.max_diag_basis_size:,}")
 
         # Compute coverage statistics
         coverage_accumulated = min(1.0, self.max_accumulated_basis / n_valid_configs)

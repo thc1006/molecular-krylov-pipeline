@@ -33,9 +33,9 @@ if torch.cuda.is_available():
 
 # Connection cache for avoiding recomputation
 try:
-    from ..utils.connection_cache import ConnectionCache
+    from ..utils.connection_cache import ConnectionCache, compute_max_cache_size
 except ImportError:
-    from utils.connection_cache import ConnectionCache
+    from utils.connection_cache import ConnectionCache, compute_max_cache_size
 
 # AutoregressiveFlowSampler import — optional, graceful fallback to None sentinel
 try:
@@ -212,14 +212,27 @@ class PhysicsGuidedFlowTrainer:
         # Accumulated basis
         self.accumulated_basis = None
 
-        # Connection cache for avoiding recomputation of Hamiltonian connections
+        # Connection cache for avoiding recomputation of Hamiltonian connections.
+        # Auto-scale max_cache_size to fit within UMA memory budget when the
+        # Hamiltonian provides orbital/electron counts (e.g. 52Q: 100K entries
+        # would need 666 GB, auto-scaled to ~1200 entries within 8 GB).
         self.connection_cache = None
         if config.use_connection_cache:
             num_sites = hamiltonian.num_sites
+            cache_size = config.max_cache_size
+            if hasattr(hamiltonian, "n_orbitals") and hasattr(hamiltonian, "n_alpha"):
+                safe_size = compute_max_cache_size(
+                    n_orbitals=hamiltonian.n_orbitals,
+                    n_alpha=hamiltonian.n_alpha,
+                    n_beta=hamiltonian.n_beta,
+                    num_sites=num_sites,
+                    memory_budget_mb=8192.0,  # 8 GB default budget (safe for 128 GB UMA)
+                )
+                cache_size = min(cache_size, safe_size)
             self.connection_cache = ConnectionCache(
                 num_sites=num_sites,
-                max_cache_size=config.max_cache_size,
-                device=device
+                max_cache_size=cache_size,
+                device=device,
             )
 
         # torch.compile is disabled for NQS forward passes due to incompatibility

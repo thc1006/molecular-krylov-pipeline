@@ -629,29 +629,22 @@ class MolecularHamiltonian(Hamiltonian):
             self._double_same_h2e = torch.empty(0, device=device)
 
         # === DOUBLE EXCITATIONS: Alpha-Beta (no exchange) ===
-        # All (q_a, s_b, p_a, r_b) combinations
-        all_q = []
-        all_s = []
-        all_p = []
-        all_r = []
-        for q in range(n_orb):
-            for s in range(n_orb):
-                for p in range(n_orb):
-                    if p == q:
-                        continue
-                    for r in range(n_orb):
-                        if r == s:
-                            continue
-                        all_q.append(q)
-                        all_s.append(s)
-                        all_p.append(p)
-                        all_r.append(r)
-
-        if len(all_q) > 0:
-            ab_q = torch.tensor(all_q, device=device)
-            ab_s = torch.tensor(all_s, device=device)
-            ab_p = torch.tensor(all_p, device=device)
-            ab_r = torch.tensor(all_r, device=device)
+        # All (q_a, s_b, p_a, r_b) combinations where p!=q and r!=s.
+        # Vectorized via meshgrid: O(1) Python ops instead of O(n_orb^4) loop.
+        # For n_orb=26 (52Q): 422,500 entries generated in ~1ms vs ~2s Python loop.
+        if n_orb > 0:
+            idx = torch.arange(n_orb, device=device)
+            g_q, g_s, g_p, g_r = torch.meshgrid(idx, idx, idx, idx, indexing="ij")
+            g_q = g_q.reshape(-1)
+            g_s = g_s.reshape(-1)
+            g_p = g_p.reshape(-1)
+            g_r = g_r.reshape(-1)
+            # Filter: p != q AND r != s
+            keep = (g_p != g_q) & (g_r != g_s)
+            ab_q = g_q[keep]
+            ab_s = g_s[keep]
+            ab_p = g_p[keep]
+            ab_r = g_r[keep]
 
             # h2e values (no exchange for alpha-beta)
             ab_h2e = self._h2e_gpu[ab_p, ab_q, ab_r, ab_s]

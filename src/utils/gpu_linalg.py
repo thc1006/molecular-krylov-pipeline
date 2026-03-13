@@ -256,6 +256,11 @@ def sparse_hamiltonian_eigsh(
     HF row ~7.8K, singles ~250, doubles ~36-50. Weighted avg ~54-128 for
     essential-only basis. Matrix is 0.1-6% dense — highly efficient for eigsh.
 
+    GPU acceleration: When CuPy is available and basis is on CUDA, uses
+    CuPy's GPU-accelerated eigsh (CUDA ARPACK). On DGX Spark UMA, the
+    scipy→CuPy CSR conversion is near-zero-copy. Falls back to SciPy CPU
+    ARPACK on failure or when CuPy is unavailable.
+
     Args:
         hamiltonian: MolecularHamiltonian with get_sparse_matrix_elements()
                      and diagonal_elements_batch() methods
@@ -300,6 +305,39 @@ def sparse_hamiltonian_eigsh(
         eigenvectors = torch.eye(n, 1, dtype=torch.float64)
         return eigenvalues.to(device), eigenvectors.to(device)
 
+    # ── CuPy GPU eigsh path ────────────────────────────────────────────
+    # For basis on CUDA with CuPy available, use GPU-accelerated ARPACK.
+    # On DGX Spark UMA, scipy CSR → CuPy CSR is a near-zero-copy transfer.
+    # Shift-invert is not supported by CuPy eigsh, so we fall through to CPU.
+    if (
+        CUPY_AVAILABLE
+        and device.type == "cuda"
+        and not shift_invert
+        and n >= 3000  # GPU overhead not worth it below ~3K (benchmark: 60x at 15K)
+    ):
+        try:
+            H_cupy = cupy_csr(
+                (
+                    cp.asarray(H_csr.data),
+                    cp.asarray(H_csr.indices),
+                    cp.asarray(H_csr.indptr),
+                ),
+                shape=H_csr.shape,
+            )
+            eigenvalues_cp, eigenvectors_cp = cupy_eigsh(
+                H_cupy, k=k_eig, which=which
+            )
+            evals_t = torch.as_tensor(
+                eigenvalues_cp.get(), dtype=torch.float64, device=device
+            )
+            evecs_t = torch.as_tensor(
+                eigenvectors_cp.get(), dtype=torch.float64, device=device
+            )
+            return evals_t, evecs_t
+        except Exception:
+            pass  # fall through to CPU eigsh
+
+    # ── CPU SciPy eigsh fallback ───────────────────────────────────────
     if shift_invert:
         sigma = float(hamiltonian.diagonal_element(
             hamiltonian.get_hf_state()

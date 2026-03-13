@@ -15,6 +15,63 @@ import torch
 from typing import Dict, Tuple, Optional, List
 
 
+def compute_max_cache_size(
+    n_orbitals: int,
+    n_alpha: int,
+    n_beta: int,
+    num_sites: int = 0,
+    memory_budget_mb: float = 8192.0,
+) -> int:
+    """
+    Compute max ConnectionCache entries that fit within a memory budget.
+
+    At 52Q (n_orb=26, n_alpha=5, n_beta=5): each entry stores ~15,435
+    connections × (52 sites × 8 + 8) bytes = ~6.6 MB. The default 100K
+    entries would need 666 GB — far exceeding 128 GB UMA.
+
+    This function computes the combinatorial upper bound on connections
+    per config (singles + same-spin doubles + alpha-beta doubles) and
+    sizes the cache accordingly.
+
+    Args:
+        n_orbitals: Number of spatial orbitals
+        n_alpha: Number of alpha electrons
+        n_beta: Number of beta electrons
+        num_sites: Number of spin-orbital sites (default: 2 * n_orbitals)
+        memory_budget_mb: Target memory budget in MB (default 8192 = 8 GB)
+
+    Returns:
+        Maximum number of cache entries that fit within the budget.
+    """
+    from math import comb
+
+    if num_sites <= 0:
+        num_sites = 2 * n_orbitals
+
+    # Upper-bound connections per config (Slater-Condon rules)
+    singles = n_alpha * (n_orbitals - n_alpha) + n_beta * (n_orbitals - n_beta)
+    same_doubles = (
+        comb(n_alpha, 2) * comb(n_orbitals - n_alpha, 2)
+        + comb(n_beta, 2) * comb(n_orbitals - n_beta, 2)
+    )
+    ab_doubles = (
+        n_alpha * (n_orbitals - n_alpha) * n_beta * (n_orbitals - n_beta)
+    )
+    avg_conn = singles + same_doubles + ab_doubles
+
+    # Memory per entry: connected configs tensor + elements tensor + Python overhead
+    # connected: (n_conn, num_sites) int64 → n_conn * num_sites * 8
+    # elements:  (n_conn,) float64         → n_conn * 8
+    # Python dict/LRU overhead             → ~200 bytes per entry
+    bytes_per_entry = avg_conn * (num_sites * 8 + 8) + 200
+
+    budget_bytes = memory_budget_mb * 1024 * 1024
+    max_entries = int(budget_bytes / max(bytes_per_entry, 1))
+
+    # Floor at 100 entries (cache is still useful for HF + singles)
+    return max(100, max_entries)
+
+
 class ConnectionCache:
     """
     Cache for Hamiltonian connections using GPU-accelerated integer encoding.

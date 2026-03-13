@@ -1595,9 +1595,18 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             indices = torch.randperm(len(basis))[:n_sample]
 
         # B4: Streaming connection discovery with per-chunk dedup.
-        # Processes sampled basis in chunks to bound peak memory at ~2GB
-        # instead of materializing all connected configs at once.
-        CHUNK_SIZE = 500  # configs per chunk — bounds intermediate tensors
+        # Processes sampled basis in chunks to bound peak memory.
+        # Adaptive chunk sizing: target 4 GB intermediate budget.
+        # At 52Q: ~15,435 connections/config × 52 sites × 8 bytes = 6.4 MB/config
+        #         → CHUNK_SIZE = 4096 MB / 6.4 MB ≈ 640
+        # At 20Q: ~500 connections/config × 20 × 8 = 80 KB/config → capped at 2000
+        CHUNK_MEMORY_BUDGET_MB = 4096
+        if hasattr(self.hamiltonian, "estimate_connections_per_config"):
+            est_conn = self.hamiltonian.estimate_connections_per_config()
+        else:
+            est_conn = 500  # conservative fallback
+        bytes_per_config = est_conn * n_sites * 8
+        CHUNK_SIZE = max(10, min(2000, int(CHUNK_MEMORY_BUDGET_MB * 1e6 / max(bytes_per_config, 1))))
 
         sampled_basis = basis[indices]
         new_set = set()
