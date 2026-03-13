@@ -19,8 +19,13 @@ Configuration Interaction) accuracy by:
    with either **SKQD** (Krylov time evolution) or **SQD** (IBM's batch
    diagonalization with config recovery).
 
-All molecular integrals come from **PySCF** (STO-3G basis). Reference energies
-are FCI, computed at runtime via `MolecularHamiltonian.fci_energy()`.
+Molecular integrals come from **PySCF** (STO-3G and cc-pVDZ with CAS support).
+Reference energies are FCI (small) or CASCI (large), computed at runtime.
+
+**Current state (2026-03-09)**: 587 tests pass. SKQD proven to 40Q (CAS(10,20)).
+NF provides no benefit over Direct-CI + Krylov at 40Q — root causes identified
+(REINFORCE optimizer, wrong sign factorization, no H-coupling guidance).
+See `docs/TODO-PHASE-6.md` for fix plan.
 
 ---
 
@@ -31,13 +36,16 @@ src/
 ├── pipeline.py                        # Orchestrator: PipelineConfig + FlowGuidedKrylovPipeline
 ├── flows/
 │   ├── particle_conserving_flow.py    # ParticleConservingFlowSampler (SigmoidTopK + Plackett-Luce)
-│   └── physics_guided_training.py     # PhysicsGuidedFlowTrainer co-trains NF + NQS
+│   ├── autoregressive_flow.py         # AutoregressiveFlowSampler (decoder-only Transformer, KV cache)
+│   ├── physics_guided_training.py     # PhysicsGuidedFlowTrainer co-trains NF + NQS
+│   ├── vmc_training.py                # VMCTrainer (REINFORCE — needs MinSR, default OFF)
+│   └── sign_network.py                # SignNetwork (FC→tanh — needs phase/det upgrade)
 ├── nqs/
 │   ├── base.py                        # NeuralQuantumState ABC
 │   └── dense.py                       # DenseNQS (real-valued log-amplitude network)
 ├── hamiltonians/
 │   ├── base.py                        # Hamiltonian ABC (diagonal_element, get_connections)
-│   └── molecular.py                   # MolecularHamiltonian (PySCF, Slater-Condon, Numba JIT)
+│   └── molecular.py                   # MolecularHamiltonian (PySCF, Slater-Condon, Numba JIT, CAS)
 ├── krylov/
 │   ├── skqd.py                        # SampleBasedKrylovDiagonalization + FlowGuidedSKQD
 │   ├── sqd.py                         # SQDSolver (IBM paper algorithm)
@@ -49,7 +57,7 @@ src/
 │   ├── eigensolver.py                 # Davidson / sparse eigsh / adaptive eigensolver
 │   └── utils.py                       # Hamming distance, excitation rank utilities
 └── utils/
-    ├── gpu_linalg.py                  # gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    ├── gpu_linalg.py                  # gpu_eigh, gpu_eigsh, gpu_expm_multiply, Lanczos reorth
     ├── connection_cache.py            # LRU cache for Hamiltonian connections (GPU keys)
     ├── config_hash.py                 # Overflow-safe config integer hashing (n_sites >= 64)
     ├── hamiltonian_cache.py           # Disk cache for integrals (h1e/h2e) and FCI energy
@@ -369,7 +377,54 @@ CuPy integration uses DLPack zero-copy: `cp.from_dlpack(tensor.detach())`
 
 LRU cache for `hamiltonian.get_connections(config)`. Keys are GPU-encoded
 integers (config tensor → single int via bit packing). Prevents redundant
-Slater-Condon rule evaluations during training.
+Slater-Condon rule evaluations during training. Uses `config_integer_hash()`
+for overflow-safe keys (split hash for n_sites >= 53).
+
+### 4.11 AutoregressiveFlowSampler (src/flows/autoregressive_flow.py)
+
+Phase 4a. Decoder-only Transformer, QiankunNet-inspired. Drop-in replacement
+for `ParticleConservingFlowSampler`.
+
+- Quaternary states: {empty, beta, alpha, alpha+beta} per orbital
+- BOS token starts the autoregressive chain
+- Pre-LN with causal mask (no future leaking)
+- Vectorized validity mask enforces particle conservation
+- KV-cached decoding: O(n^2) vs O(n^3) without cache
+- Exact log_prob via teacher forcing
+
+```python
+flow = AutoregressiveFlowSampler(
+    n_orbitals=20, n_alpha=5, n_beta=5,
+    config=AutoregressiveConfig(d_model=128, n_heads=4, n_layers=4)
+)
+log_probs, configs = flow.sample(batch_size=1000)
+```
+
+### 4.12 VMCTrainer (src/flows/vmc_training.py)
+
+REINFORCE-based VMC energy minimization. **Default OFF** — NQS-SC > NQS-VMC
+(arXiv:2602.12993). Does not converge beyond ~16Q because REINFORCE is the
+wrong optimizer (field uses SR/MinSR/SPRING). See TODO-PHASE-6 P0.1.
+
+```python
+trainer = VMCTrainer(flow, hamiltonian, config=VMCConfig(
+    n_steps=100, n_samples=500, lr=1e-3,
+    optimizer_type="reinforce",  # needs "minsr" upgrade
+))
+```
+
+### 4.13 SignNetwork (src/flows/sign_network.py)
+
+Feedforward NN → GELU → tanh → sign in (-1,1). Enables psi(x)=sqrt(p(x))*s(x).
+**Wrong approach** — SOTA uses determinant-based sign (NNBF) or continuous phase
+(QiankunNet e^{i*phi}). See TODO-PHASE-6 P2.1.
+
+### 4.14 NNCIActiveLearning (src/krylov/nnci.py)
+
+NN classifier + iterative active learning loop for configuration selection.
+ConfigImportanceClassifier (feedforward) predicts importance scores.
+CandidateGenerator produces combinatorial excitations (singles/doubles/triples).
+Iterative: train → score → expand → diag → retrain.
 
 ---
 
@@ -407,9 +462,19 @@ Ablation axes:
 | ch4 | CH4 | `create_ch4_hamiltonian()` | 18 | 15,876 | Yes |
 | n2 | N2 | `create_n2_hamiltonian(bond_length=1.10)` | 20 | 14,400 | Yes |
 
-All use STO-3G basis. `create_c2h4_hamiltonian` does **not** exist as a
-factory function — C2H4 (28 qubits, 9M configs) must be constructed manually
-via PySCF integrals.
+All STO-3G systems use `MolecularHamiltonian` directly. Additional CAS systems
+via `compute_molecular_integrals(cas=(nelecas, ncas))`:
+
+| Key | System | Factory | Qubits | Valid Configs | FCI Tractable? |
+|-----|--------|---------|--------|---------------|----------------|
+| n2_cas12 | N2/cc-pVDZ CAS(10,12) | `create_n2_cas_hamiltonian(basis='cc-pvdz', cas=(10,12))` | 24 | 427,350 | CASCI |
+| n2_cas15 | N2/cc-pVDZ CAS(10,15) | `create_n2_cas_hamiltonian(basis='cc-pvdz', cas=(10,15))` | 30 | ~9M | CASCI fallback |
+| n2_cas20 | N2/cc-pVDZ CAS(10,20) | `create_n2_cas_hamiltonian(basis='cc-pvdz', cas=(10,20))` | 40 | 240M | Integrals-only |
+| cr2 | Cr2/STO-3G CAS(12,12) | `create_cr2_hamiltonian()` | 24 | — | fix_spin_(ss=0) |
+| benzene | Benzene/STO-3G CAS(6,15) | `create_benzene_hamiltonian()` | 30 | — | CASCI |
+
+For CAS(10,20)+ (>50M configs), `compute_molecular_integrals()` auto-skips
+`mc.kernel()` and extracts h1e/h2e directly from HF MOs (integrals-only CASCI).
 
 ---
 

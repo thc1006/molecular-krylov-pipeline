@@ -4,6 +4,7 @@
 > Hardware: DGX Spark GB10 (20 ARM cores, 128GB UMA, CUDA 13.0, TF32=53 TFLOPS, FP64=0.48 TFLOPS)
 > Principle: RED-GREEN-REFACTOR for every PR.
 > Research: See `docs/OPTIMIZATION-RESEARCH.md` for full findings.
+> **Status: Phases 0-5 COMPLETE (587 tests). Superseded by [TODO-PHASE-6.md](TODO-PHASE-6.md).**
 
 ---
 
