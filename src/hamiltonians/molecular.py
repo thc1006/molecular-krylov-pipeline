@@ -1632,9 +1632,10 @@ class MolecularHamiltonian(Hamiltonian):
         n_configs = configs.shape[0]
 
         # SIZE GUARD: refuse to allocate dense matrices that would cause OOM.
-        # n² × 8 bytes (float64): 20000² = 3.2 GB, 50000² = 20 GB, 63504² = 32 GB.
-        # On DGX Spark 128GB UMA, 20000 is a safe upper bound for dense allocation.
-        MAX_DENSE_CONFIGS = 20000
+        # n² × 8 bytes (float64): 5000² = 200 MB, 10000² = 800 MB, 20000² = 3.2 GB.
+        # On DGX Spark 128GB UMA with CUDA context + claude/node processes, 10000 is
+        # a safe upper bound. Beyond this, callers must use get_sparse_matrix_elements().
+        MAX_DENSE_CONFIGS = 10000
         if n_configs > MAX_DENSE_CONFIGS:
             mem_gb = n_configs ** 2 * 8 / 1e9
             raise MemoryError(
@@ -1773,6 +1774,10 @@ class MolecularHamiltonian(Hamiltonian):
         Returns sparse COO format data for efficient matrix construction.
         Uses GPU-accelerated vectorized batch method for speed.
 
+        For large systems (52Q+), processes configs in chunks to avoid
+        exceeding max_output_mb in get_connections_vectorized_batch.
+        The sparse COO matrix is built incrementally from each chunk.
+
         Args:
             configs: (n_configs, num_sites) configurations
 
@@ -1785,47 +1790,66 @@ class MolecularHamiltonian(Hamiltonian):
         configs = configs.to(device)
         n_configs = configs.shape[0]
 
-        # Use vectorized batch method (GPU-accelerated)
-        try:
-            all_connected, all_elements, batch_indices = (
-                self.get_connections_vectorized_batch(configs)
-            )
-        except MemoryError:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            raise
-
-        if len(all_connected) == 0:
-            return (
-                torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.float64, device=device),
-            )
-
-        # Overflow-safe integer encoding for fast lookup
+        # Build config hash for fast lookup (overflow-safe integer encoding)
         config_ints_cpu = self._config_int_hash(configs)
         config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
 
-        # Encode connected configs (overflow-safe)
-        connected_ints_cpu = self._config_int_hash(all_connected)
-        batch_indices_cpu = batch_indices.cpu().tolist()
+        # Adaptive chunk size: target 4 GB intermediate per chunk.
+        # At 52Q: 15,435 conn/config × (52×8+8) bytes = 6.6 MB/config → ~600 configs/chunk.
+        est_conn = self.estimate_connections_per_config() if hasattr(self, 'estimate_connections_per_config') else 500
+        bytes_per_config = est_conn * (self.num_sites * 8 + 8)
+        chunk_budget_mb = 4096
+        chunk_size = max(50, min(n_configs, int(chunk_budget_mb * 1e6 / max(bytes_per_config, 1))))
 
         all_rows = []
         all_cols = []
-        val_indices = []
+        all_vals = []
 
-        for k in range(len(all_connected)):
-            conn_int = connected_ints_cpu[k]
-            if conn_int in config_hash:
-                i = config_hash[conn_int]
-                j = batch_indices_cpu[k]
-                if i != j:
-                    all_rows.append(i)
-                    all_cols.append(j)
-                    val_indices.append(k)
+        for chunk_start in range(0, n_configs, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_configs)
+            chunk_configs = configs[chunk_start:chunk_end]
 
-        if len(all_rows) == 0:
+            try:
+                chunk_connected, chunk_elements, chunk_batch_idx = (
+                    self.get_connections_vectorized_batch(chunk_configs)
+                )
+            except MemoryError:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+
+            if len(chunk_connected) == 0:
+                continue
+
+            # Map connected configs to global indices
+            connected_ints_cpu = self._config_int_hash(chunk_connected)
+            batch_idx_cpu = chunk_batch_idx.cpu().tolist()
+
+            chunk_rows = []
+            chunk_cols = []
+            chunk_val_idx = []
+
+            for k in range(len(chunk_connected)):
+                conn_int = connected_ints_cpu[k]
+                if conn_int in config_hash:
+                    i = config_hash[conn_int]
+                    j = batch_idx_cpu[k] + chunk_start  # offset to global index
+                    if i != j:
+                        chunk_rows.append(i)
+                        chunk_cols.append(j)
+                        chunk_val_idx.append(k)
+
+            if chunk_val_idx:
+                all_rows.append(torch.tensor(chunk_rows, dtype=torch.long, device=device))
+                all_cols.append(torch.tensor(chunk_cols, dtype=torch.long, device=device))
+                all_vals.append(chunk_elements[torch.tensor(chunk_val_idx, device=device)])
+
+            # Free intermediate tensors immediately
+            del chunk_connected, chunk_elements, chunk_batch_idx
+            del connected_ints_cpu, batch_idx_cpu
+
+        if not all_rows:
             return (
                 torch.tensor([], dtype=torch.long, device=device),
                 torch.tensor([], dtype=torch.long, device=device),
@@ -1833,9 +1857,9 @@ class MolecularHamiltonian(Hamiltonian):
             )
 
         return (
-            torch.tensor(all_rows, dtype=torch.long, device=device),
-            torch.tensor(all_cols, dtype=torch.long, device=device),
-            all_elements[torch.tensor(val_indices, device=device)],
+            torch.cat(all_rows),
+            torch.cat(all_cols),
+            torch.cat(all_vals),
         )
 
     def matrix_elements(

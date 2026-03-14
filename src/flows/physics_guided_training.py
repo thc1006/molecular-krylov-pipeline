@@ -1442,21 +1442,32 @@ class PhysicsGuidedFlowTrainer:
                     log_allocation("_compute_accumulated_energy", n_basis, dtype="float64", layout="sparse")
                 from scipy.sparse import coo_matrix, diags
                 from scipy.sparse.linalg import eigsh
+                import gc
 
                 basis = self.accumulated_basis
-                rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
-                rows_np = rows.cpu().numpy()
-                cols_np = cols.cpu().numpy()
-                vals_np = vals.cpu().numpy().astype(np.float64)
+                try:
+                    rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+                    rows_np = rows.cpu().numpy()
+                    cols_np = cols.cpu().numpy()
+                    vals_np = vals.cpu().numpy().astype(np.float64)
+                    # Free GPU tensors immediately
+                    del rows, cols, vals
 
-                H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_basis, n_basis))
-                diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
-                H_csr = H_coo.tocsr()
-                H_csr = 0.5 * (H_csr + H_csr.T)
-                H_csr = H_csr + diags(diag_np, 0, shape=(n_basis, n_basis), format='csr')
+                    H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_basis, n_basis))
+                    del rows_np, cols_np, vals_np
+                    diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+                    H_csr = H_coo.tocsr()
+                    del H_coo
+                    H_csr = 0.5 * (H_csr + H_csr.T)
+                    H_csr = H_csr + diags(diag_np, 0, shape=(n_basis, n_basis), format='csr')
+                    del diag_np
 
-                eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-6)
-                return float(eigenvalues[0])
+                    eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-6)
+                    return float(eigenvalues[0])
+                finally:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Dense path for small bases
             if log_allocation:
@@ -1465,6 +1476,7 @@ class PhysicsGuidedFlowTrainer:
                 self.accumulated_basis, self.accumulated_basis
             )
             H_np = H_matrix.cpu().numpy().astype(np.float64)
+            del H_matrix
 
             # Ensure Hermitian
             H_np = 0.5 * (H_np + H_np.T)
@@ -1475,6 +1487,7 @@ class PhysicsGuidedFlowTrainer:
                     from scipy.sparse import csr_matrix
                     from scipy.sparse.linalg import eigsh
                     H_sparse = csr_matrix(H_np)
+                    del H_np
                     eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-6)
                     return float(eigenvalues[0])
                 except Exception as e:

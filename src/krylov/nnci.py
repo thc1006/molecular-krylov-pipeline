@@ -461,10 +461,17 @@ class NNCIActiveLearning:
             "final_basis": self.basis,
         }
 
+    # Threshold above which diagonalization uses sparse path to avoid OOM.
+    # Dense n×n (float64): 5000² = 200 MB (safe), 10000² = 800 MB (risky on UMA).
+    SPARSE_DIAG_THRESHOLD = 3000
+
     def _diagonalize(
         self, basis: torch.Tensor
     ) -> Tuple[float, np.ndarray]:
         """Diagonalize Hamiltonian in the given basis.
+
+        Uses sparse eigensolver for large bases (>SPARSE_DIAG_THRESHOLD) to
+        avoid O(n²) dense matrix allocation that caused OOM on DGX Spark UMA.
 
         Returns
         -------
@@ -473,13 +480,61 @@ class NNCIActiveLearning:
         ci_coeffs : np.ndarray
             Absolute CI coefficients (|c_i|) for each basis config.
         """
+        import gc
+
+        n = len(basis)
+
+        if n >= self.SPARSE_DIAG_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+            return self._diagonalize_sparse(basis)
+
+        # Dense path for small bases
         H = self.hamiltonian.matrix_elements(basis, basis)
         H_np = H.cpu().numpy().astype(np.float64)
+        del H
         H_np = 0.5 * (H_np + H_np.T)  # Symmetrize
         eigenvalues, eigenvectors = np.linalg.eigh(H_np)
         energy = float(eigenvalues[0])
         ci_coeffs = np.abs(eigenvectors[:, 0])
         return energy, ci_coeffs
+
+    def _diagonalize_sparse(
+        self, basis: torch.Tensor
+    ) -> Tuple[float, np.ndarray]:
+        """Sparse diagonalization for large bases.
+
+        Builds sparse CSR Hamiltonian via get_sparse_matrix_elements() +
+        diagonal_elements_batch(), then uses scipy.sparse.linalg.eigsh.
+        Memory: O(nnz) instead of O(n²).
+        """
+        import gc
+        from scipy.sparse import coo_matrix, diags
+        from scipy.sparse.linalg import eigsh
+
+        n = len(basis)
+
+        try:
+            rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+            rows_np = rows.cpu().numpy()
+            cols_np = cols.cpu().numpy()
+            vals_np = vals.cpu().numpy().astype(np.float64)
+
+            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+            diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+            H_csr = H_coo.tocsr()
+            H_csr = 0.5 * (H_csr + H_csr.T)
+            H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+            # eigsh with k=min(6, n-1) to get ground state + coefficients
+            k = min(6, n - 1)
+            eigenvalues, eigenvectors = eigsh(H_csr, k=k, which='SA', tol=1e-8)
+
+            energy = float(eigenvalues[0])
+            ci_coeffs = np.abs(eigenvectors[:, 0])
+            return energy, ci_coeffs
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _train_classifier(
         self, basis: torch.Tensor, ci_coeffs: np.ndarray
