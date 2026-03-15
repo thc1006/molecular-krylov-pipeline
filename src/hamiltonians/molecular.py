@@ -2758,7 +2758,24 @@ def create_cr2_hamiltonian(
 
     nelecas, ncas = cas
 
-    mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+    # For large active spaces (ncas >= 15), CASSCF's internal FCI solver
+    # is infeasible (CAS(12,20) = C(20,6)^2 = 1.5B configs, 12 GB/vector).
+    # Use CASCI (no orbital optimization) + integrals-only mode.
+    from math import comb as _comb
+    if isinstance(nelecas, (tuple, list)):
+        _na, _nb = nelecas[0], nelecas[1]
+    else:
+        _na = nelecas // 2
+        _nb = nelecas // 2
+    _n_configs = _comb(ncas, _na) * _comb(ncas, _nb)
+    _FCI_CONFIG_LIMIT = 50_000_000
+
+    use_casci = ncas >= 15 or _n_configs > _FCI_CONFIG_LIMIT
+
+    if use_casci:
+        mc = mcscf.CASCI(mf, ncas=ncas, nelecas=nelecas)
+    else:
+        mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
 
     # Linear molecules (D_inf_h / C_inf_v) need non-symmetry FCI solver
     if mol.symmetry and mol.topgroup in ("Dooh", "Coov"):
@@ -2767,14 +2784,23 @@ def create_cr2_hamiltonian(
     # Cr2 CASSCF without spin constraint converges to septet (S=3, S^2=12)
     # instead of the singlet ground state. fix_spin_ adds a penalty to
     # enforce <S^2> = 0 (singlet).
-    mc.fix_spin_(ss=0)
-    mc.kernel()
+    if not use_casci:
+        mc.fix_spin_(ss=0)
 
-    if not mc.converged:
-        warnings.warn(
-            f"CASSCF did not converge for Cr2 CAS({nelecas},{ncas}). "
-            "Integrals may be unreliable."
+    if use_casci and _n_configs > _FCI_CONFIG_LIMIT:
+        print(
+            f"[CAS] Skipping FCI solve for Cr2 CAS({nelecas},{ncas}): "
+            f"{_n_configs:,} configs > {_FCI_CONFIG_LIMIT:,} limit. "
+            f"Extracting integrals only."
         )
+    else:
+        mc.kernel()
+
+        if not use_casci and not mc.converged:
+            warnings.warn(
+                f"CASSCF did not converge for Cr2 CAS({nelecas},{ncas}). "
+                "Integrals may be unreliable."
+            )
 
     # Extract active-space integrals
     h1e_cas, e_core = mc.h1e_for_cas()
