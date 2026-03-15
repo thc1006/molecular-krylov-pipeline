@@ -111,6 +111,10 @@ class VMCConfig:
           cost.  This is the field standard for NQS/VMC (Chen & Heyl 2024).
         - ``"reinforce"``: REINFORCE with baseline subtraction.  Simple but
           high variance; does not converge beyond ~16 qubits.
+        - ``"spring"``: SPRING (Subsampled Projected-Increment Natural Gradient).
+          Extends MinSR with Kaczmarz projection + momentum.  Preserves
+          optimization history across steps via warm-started phi vector.
+          Reference: Nys & Lovato, JCP 2024 (arXiv:2401.10190).
 
     sr_regularization : float
         Initial diagonal regularization lambda for S + lambda*I in MinSR.
@@ -139,6 +143,9 @@ class VMCConfig:
     sr_regularization: float = 1e-3
     sr_reg_decay: float = 0.99
     sr_reg_min: float = 1e-5
+    # SPRING hyperparameters (only used when optimizer_type="spring")
+    spring_momentum: float = 0.95  # mu: Kaczmarz decay factor for phi history
+    spring_proj_reg: float = 1.0  # omega: projection regularization for Cholesky stability
 
 
 class VMCTrainer:
@@ -208,7 +215,7 @@ class VMCTrainer:
         )
 
         # Validate optimizer_type
-        valid_optimizers = ("reinforce", "minsr")
+        valid_optimizers = ("reinforce", "minsr", "spring")
         if self.config.optimizer_type not in valid_optimizers:
             raise ValueError(
                 f"Unknown optimizer_type '{self.config.optimizer_type}'. "
@@ -228,8 +235,8 @@ class VMCTrainer:
             self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizer, gamma=self.config.lr_decay
             )
-        else:
-            # MinSR: manual parameter updates for flow, Adam for sign network.
+        elif self.config.optimizer_type in ("minsr", "spring"):
+            # MinSR / SPRING: manual parameter updates for flow, Adam for sign network.
             # We still use a "dummy" optimizer for sign network if present,
             # and track learning rate decay manually for the MinSR flow update.
             self._minsr_lr = self.config.lr
@@ -253,6 +260,10 @@ class VMCTrainer:
             self._dummy_param = torch.nn.Parameter(torch.zeros(1))
             self.optimizer = torch.optim.Adam([self._dummy_param], lr=self.config.lr)
             self.scheduler = None  # Not used for MinSR; LR tracked via _minsr_lr
+
+            # SPRING: persistent phi vector for Kaczmarz warm-start
+            if self.config.optimizer_type == "spring":
+                self._spring_phi = None  # Lazily initialized on first step
 
         self.energy_baseline: float | None = None
 
@@ -592,6 +603,89 @@ class VMCTrainer:
 
         return delta.float(), grad_norm
 
+    def _spring_update(
+        self,
+        jacobian: torch.Tensor,
+        local_energies: torch.Tensor,
+    ) -> tuple:
+        """Compute the SPRING parameter update direction.
+
+        SPRING extends MinSR with Kaczmarz projection + momentum.  Instead of
+        finding the minimum-norm solution (MinSR), SPRING finds the solution
+        closest to mu * phi_{k-1}, preserving optimization history.
+
+        Algorithm (Nys & Lovato, JCP 2024, Eq. 33-34):
+            zeta = e_c - mu * J_c @ phi_{k-1}
+            phi_k = J_c^T @ (J_c J_c^T + lam*N*I + omega*P)^{-1} @ zeta + mu * phi_{k-1}
+            d_theta = -min(eta, C / ||phi_k||) * phi_k
+        """
+        n_samples = jacobian.shape[0]
+        device = jacobian.device
+        mu = self.config.spring_momentum
+        omega = self.config.spring_proj_reg
+
+        # FP64 for numerical stability
+        J = jacobian.double()
+        e_loc = local_energies.detach().double().to(device)
+
+        # Center Jacobian and energies
+        J_c = J - J.mean(dim=0, keepdim=True)
+        e_c = e_loc - e_loc.mean()
+
+        # Lazy init phi on first call (now we know N_params and device)
+        if self._spring_phi is None:
+            self._spring_phi = torch.zeros(
+                jacobian.shape[1], dtype=torch.float64, device=device
+            )
+        phi_prev = self._spring_phi.to(device)
+
+        # SPRING modified residual: zeta = e_c - mu * J_c @ phi_prev
+        zeta = e_c - mu * (J_c @ phi_prev)
+
+        # Gram matrix with projection regularization
+        lam = self._sr_lambda
+        G = J_c @ J_c.T
+        G += lam * n_samples * torch.eye(n_samples, dtype=torch.float64, device=device)
+        # P = (1/N_s) * 1*1^T — ensures Cholesky stability
+        G += omega * torch.ones(
+            n_samples, n_samples, dtype=torch.float64, device=device
+        ) / n_samples
+
+        # Solve via Cholesky (SPD matrix)
+        try:
+            L = torch.linalg.cholesky(G)
+            z = torch.cholesky_solve(zeta.unsqueeze(1), L).squeeze(1)
+        except torch.linalg.LinAlgError:
+            try:
+                z = torch.linalg.solve(G, zeta)
+            except torch.linalg.LinAlgError:
+                warnings.warn(
+                    "SPRING: Gram matrix singular. Falling back to gradient direction.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                f = J_c.T @ e_c / n_samples
+                delta = -self._minsr_lr * f
+                return delta.float(), f.norm().item()
+
+        # SPRING update: phi_k = J_c^T @ z + mu * phi_prev
+        phi_new = J_c.T @ z + mu * phi_prev
+
+        # Store for next step
+        self._spring_phi = phi_new.clone().detach()
+
+        # Apply learning rate with norm constraint (Eq. 35)
+        phi_norm = phi_new.norm().item()
+        eta = self._minsr_lr
+        if phi_norm > 0:
+            scale = min(eta, self.config.clip_grad / phi_norm)
+        else:
+            scale = eta
+        delta = -scale * phi_new
+
+        grad_norm = delta.norm().item()
+        return delta.float(), grad_norm
+
     def _apply_minsr_update(self, delta: torch.Tensor) -> None:
         """Apply the MinSR parameter update to flow parameters.
 
@@ -788,10 +882,85 @@ class VMCTrainer:
             "loss": energy_mean,  # For MinSR, "loss" is the energy (no REINFORCE loss)
         }
 
+    def _spring_step(self) -> dict[str, float]:
+        """Execute a single SPRING VMC optimization step.
+
+        Identical to _minsr_step except:
+        - Uses _spring_update instead of _minsr_update
+        - Norm clipping is handled inside _spring_update (via Eq. 35)
+        """
+        self.flow.train()
+        if self.sign_network is not None:
+            self.sign_network.train()
+        cfg = self.config
+
+        # Steps 1-3: identical to MinSR
+        with torch.no_grad():
+            states, sample_log_probs = self.flow._sample_autoregressive(cfg.n_samples)
+            configs = states_to_configs(states, self.flow.n_orbitals)
+
+        if self.sign_network is not None:
+            local_energies = self.compute_local_energies(configs, sample_log_probs)
+        else:
+            with torch.no_grad():
+                local_energies = self.compute_local_energies(configs, sample_log_probs)
+
+        energy_mean = local_energies.detach().mean().item()
+        energy_std = local_energies.detach().std(correction=0).item()
+
+        jacobian = self._compute_per_sample_jacobian(configs)
+
+        if torch.isnan(jacobian).any() or torch.isnan(local_energies.detach()).any():
+            warnings.warn(
+                "SPRING: NaN detected in Jacobian or local energies. Skipping step.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._minsr_lr *= cfg.lr_decay
+            self._sr_lambda = max(self._sr_lambda * cfg.sr_reg_decay, cfg.sr_reg_min)
+            if self._sign_optimizer is not None:
+                self._sign_scheduler.step()
+            self.optimizer.param_groups[0]["lr"] = self._minsr_lr
+            return {
+                "energy": energy_mean,
+                "energy_std": energy_std,
+                "grad_norm": 0.0,
+                "loss": energy_mean,
+            }
+
+        # Step 4: SPRING update (includes norm constraint)
+        delta, grad_norm = self._spring_update(jacobian, local_energies)
+
+        # Step 5: Apply update
+        self._apply_minsr_update(delta)
+
+        # Step 6: Sign network update (same as MinSR)
+        if self.sign_network is not None and local_energies.requires_grad:
+            if self._sign_optimizer is not None:
+                self._sign_optimizer.zero_grad()
+            sign_loss = local_energies.mean()
+            sign_loss.backward()
+            if self._sign_optimizer is not None:
+                torch.nn.utils.clip_grad_norm_(self.sign_network.parameters(), cfg.clip_grad)
+                self._sign_optimizer.step()
+                self._sign_scheduler.step()
+
+        # Step 7: Decay SR regularization and learning rate
+        self._sr_lambda = max(self._sr_lambda * cfg.sr_reg_decay, cfg.sr_reg_min)
+        self._minsr_lr *= cfg.lr_decay
+        self.optimizer.param_groups[0]["lr"] = self._minsr_lr
+
+        return {
+            "energy": energy_mean,
+            "energy_std": energy_std,
+            "grad_norm": grad_norm,
+            "loss": energy_mean,
+        }
+
     def train_step(self) -> dict[str, float]:
         """Execute a single VMC optimization step.
 
-        Dispatches to ``_reinforce_step()`` or ``_minsr_step()`` based on
+        Dispatches to the appropriate step method based on
         ``self.config.optimizer_type``.
 
         Returns
@@ -801,6 +970,8 @@ class VMCTrainer:
         """
         if self.config.optimizer_type == "reinforce":
             return self._reinforce_step()
+        elif self.config.optimizer_type == "spring":
+            return self._spring_step()
         else:
             return self._minsr_step()
 

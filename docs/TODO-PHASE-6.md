@@ -200,10 +200,17 @@ Krylov expansion 現在有 H-coupling ranking (P1.1) + taboo (P1.3) 做更有效
 ### P3.4: SPRING 優化器
 **影響**: 最佳 NQS 優化器 | **工作量**: 3-5 天 | **依賴**: P0.1
 **參考**: SPRING (JCP 2024, arXiv:2401.10190)
+**狀態**: 🔄 實作完成，待驗證收斂性
 
-- [ ] IMPL: SPRING = MinSR + Kaczmarz + momentum
-- [ ] 在 O 原子 40K 迭代達化學精度（MinSR/KFAC 100K 後仍失敗）
-- [ ] 需自己實現 momentum 項
+- [x] IMPL: `_spring_update()` — Kaczmarz projection + momentum (Eq. 33-34)
+- [x] `_spring_step()` — complete VMC step with SPRING optimizer
+- [x] VMCConfig: `optimizer_type="spring"`, `spring_momentum=0.95`, `spring_proj_reg=1.0`
+- [x] Cholesky solve with fallback chain (Cholesky → LU → gradient)
+- [x] Lazy phi initialization, persistent across steps
+- [x] 38 existing VMC tests pass (no regression)
+- [ ] Convergence benchmark: H2 SPRING vs MinSR (n_steps=500)
+- [ ] Convergence benchmark: LiH SPRING vs MinSR
+- [ ] 24Q+ VMC convergence test with SPRING
 
 ---
 
